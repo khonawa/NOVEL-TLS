@@ -1,0 +1,40 @@
+.heading { flex-wrap: wrap; gap: 12px 24px; margin-bottom: 24px; }
+.heading h1 { font-size: 28px; line-height: 1.2; overflow-wrap: anywhere; }
+.heading .eyebrow { margin: 0; }
+.workspace { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.configuration, .monitor { padding: 24px; min-width: 0; }
+.section-title { gap: 16px; flex-wrap: wrap; }
+.metrics { gap: 16px; }
+.metrics > div { min-width: 0; }
+.metrics strong { font-size: 28px; overflow-wrap: anywhere; }
+.metrics span { overflow-wrap: anywhere; }
+.file { min-width: 0; }
+.file input { width: 0; }
+input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.header-options { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+.toggle { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.toggle input { flex: none; width: 16px; height: 16px; accent-color: var(--accent); }
+#name { width: 100%; }
+#chinese-limit { width: 100%; }
+.scroll-settings { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.scroll-settings input { width: 100%; min-width: 0; }
+#scroll-slider { display: block; height: 28px; padding: 0; margin: 8px 0 0; accent-color: var(--accent); cursor: pointer; }
+html[data-theme="night"] { color-scheme: dark; background: #191d1c; color: #e1e8e4; --accent: #75c7a8; --line: #3a4540; }
+html[data-theme="night"] body { background-image: none; }
+html[data-theme="night"] header, html[data-theme="night"] .workspace, html[data-theme="night"] dialog { background: #222825; }
+html[data-theme="night"] input, html[data-theme="night"] select, html[data-theme="night"] button { background: #2e3732; color: #e1e8e4; border-color: #526158; }
+html[data-theme="night"] .primary { background: #28765b; color: white; }
+html[data-theme="night"] button:hover:not(:disabled) { background: #3b5145; }
+html[data-theme="night"] pre { background: #171c19; }
+html[data-theme="night"] label, html[data-theme="night"] .eyebrow, html[data-theme="night"] .brand span, html[data-theme="night"] #connection, html[data-theme="night"] .metrics span, html[data-theme="night"] .chunk span, html[data-theme="night"] .empty { color: #afc0b6; }
+html[data-theme="night"] #notice { color: #edc28c; }
+html[data-theme="night"] .chunk { border-color: var(--line); }
+@media (max-width: 760px) {
+	header { flex-wrap: wrap; padding: 20px; }
+	main { padding: 24px 20px; }
+	.header-options { justify-content: flex-start; gap: 8px 16px; }
+	.workspace { grid-template-columns: minmax(0, 1fr); }
+	.configuration, .monitor { padding: 20px; }
+	.configuration { border-right: 0; border-bottom: 1px solid var(--line); }
+	.scroll-settings { gap: 10px; }
+}

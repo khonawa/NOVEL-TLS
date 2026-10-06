@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:"><title>NovelTL</title><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="settings.css"></head>
+<body>
+<header><div class="brand">NovelTL<span>TRANSLATION WORKSPACE</span></div><div class="header-options"><label class="toggle"><input type="checkbox" id="night">Night mode</label><span id="connection">Connecting to Python</span></div></header>
+<main>
+  <section class="heading"><div><p class="eyebrow">LIBRARY</p><h1>New translation</h1></div><span class="badge">CHINESE → ENGLISH</span></section>
+  <div class="workspace">
+    <section class="configuration"><h2>Source & destination</h2>
+      <label for="input">Source novel</label><div class="file"><input id="input" readonly placeholder="No TXT selected"><button id="pick-input">Browse</button></div>
+      <label for="name">Translation name</label><input id="name" type="text" placeholder="Translation name" maxlength="180">
+      <label class="toggle"><input id="original-name" type="checkbox" checked>Original name + EN</label>
+      <label for="output">EPUB destination</label><div class="file"><input id="output" readonly placeholder="No destination selected"><button id="pick-output">Save as</button></div>
+      <label for="preset">Chunk size</label><select id="preset"><option value="125000">Reliable · 125,000 characters</option><option value="275000" selected>Balanced · 275,000 characters</option><option value="450000">Fast · 450,000 characters</option></select>
+      <div class="scroll-settings"><div><label for="scroll-interval">Scroll interval (seconds)</label><input id="scroll-interval" type="number" min="0.1" max="5" step="0.1" value="0.5" required><input id="scroll-slider" type="range" min="0.1" max="5" step="0.1" value="0.5" aria-label="Scroll interval in seconds"></div></div>
+      <label for="chinese-limit">Allowed Chinese characters per chunk</label><input id="chinese-limit" type="number" min="0" step="1" value="50" required>
+      <div class="actions"><button class="primary" id="start" disabled>Start translation</button><button id="pause" disabled>Pause</button><button id="cancel" disabled>Cancel</button></div>
+      <p id="notice" role="status">Waiting for backend.</p>
+      <div class="result"><button id="open" disabled>Open EPUB</button><button id="folder" disabled>Show in folder</button></div>
+    </section>
+    <section class="monitor"><div class="section-title"><h2>Run overview</h2><span id="status">Idle</span></div>
+      <div class="metrics"><div><strong id="complete">0 / 0</strong><span>CHUNKS COMPLETE</span></div><div><strong id="failed">0</strong><span>FAILED</span></div><div><strong id="elapsed">00:00</strong><span>ELAPSED</span></div></div>
+      <progress id="progress" max="1" value="0" aria-label="Translation progress"></progress>
+      <div id="chunks" class="chunks"><p class="empty">No active translation</p></div>
+    </section>
+  </div>
+  <section class="activity"><div class="section-title"><h2>Activity</h2><button id="clear">Clear log</button></div><pre id="log" aria-label="Activity log"></pre></section>
+</main>
+<dialog id="validation"><h2>Translation needs review</h2><p id="reason"></p><div class="actions"><button data-decision="retry" class="primary">Retry</button><button data-decision="accept">Accept anyway</button><button data-decision="skip">Skip chunk</button></div></dialog>
+<script src="app.js"></script>
+</body></html>
