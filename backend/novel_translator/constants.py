@@ -157,7 +157,7 @@ HEADER_NUMERIC_RE = re.compile(
     r"\[?\d{1,4}\]?[.\-]\s+\S"          # "001 - Title" / "12. Title"
     r"|\[\d{1,4}\]\s+\S"                # "[12] Title"
     r"|\(\d{1,4}\)"                     # "(12)"
-    r"|\d{1,4}\s+[A-Z\"'“‘]"            # "12 The Journey" (capitalised title)
+    r"|\d{1,4}\s+(?!(?:AM|PM|A\.M\.|P\.M\.)\b)[A-Z\"'“‘]"  # "12 The Journey", not "3 PM"
     r")"
 )
 HEADER_MARKDOWN_RE = re.compile(r"^\s*#{1,4}\s+\S")
@@ -165,7 +165,8 @@ HEADER_SYMBOL_WRAP_RE = re.compile(r"^\s*(?:\*{2,}|={2,}|-{2,})\s*\S.*\S\s*(?:\*
 HEADER_ALLCAPS_RE = re.compile(r"^[A-Z][A-Z\s\d:;,.!?'\-&()]+$")
 
 # Tier 3 - relaxed pattern used to locate a missing chapter number inside a gap.
-GAP_NUMBER_RE = re.compile(r"(?im)^[ \t]*\[?(\d{1,4})\]?[ \t]*[.\-:]?[ \t]*\S*[^\n]*$")
+# The number must stand alone or be followed by a separator, so "3 PM." is rejected.
+GAP_NUMBER_RE = re.compile(r"(?im)^[ \t]*\[?(\d{1,4})\]?[ \t]*(?:$|[.\-:][ \t]+\S[^\n]*$)")
 
 CHROME_ERROR_MARKERS = (
     "this site can't be reached",

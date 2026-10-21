@@ -116,6 +116,18 @@ class BridgeTests(unittest.TestCase):
             bridge.command({"kind": "settings", "scrollInterval": 1.2})
             self.assertEqual(received[0].get_scroll_interval(), 1.2)
 
+    def test_checkpoint_status_command(self):
+        received = []
+        bridge = Bridge(lambda kind, value: received.append((kind, value)))
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "test.txt"
+            source.write_text("\u4e2d" * 1000, encoding="utf-8")
+            output = Path(directory) / "test.epub"
+            bridge.command({"kind": "checkpoint_status", "input": str(source), "output": str(output), "chunkLimit": 275000})
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0][0], "checkpoint_status")
+            self.assertFalse(received[0][1]["exists"])
+
     def test_invalid_live_interval_preserves_settings(self):
         emitted = []
         bridge = Bridge(lambda kind, value: emitted.append(kind))

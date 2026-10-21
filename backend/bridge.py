@@ -7,7 +7,15 @@ import sys
 import threading
 from pathlib import Path
 
-from novel_translator.pipeline import PipelineContext, QueueHandler, TranslationRunner
+
+try:
+    from novel_translator.pipeline import PipelineContext, QueueHandler, TranslationRunner
+    from novel_translator.checkpoint import checkpoint_dir_for, load_checkpoint
+    from novel_translator.text_processing import source_fingerprint
+    from novel_translator.constants import CHUNK_PRESETS
+except ImportError as error:
+    print(json.dumps({"kind": "error", "value": f"Missing dependency: {error.name}. Install with: pip install -r requirements.txt"}, ensure_ascii=True), flush=True)
+    sys.exit(1)
 
 
 class Bridge:
@@ -42,29 +50,35 @@ class Bridge:
                 self.emit("settings_error", str(error))
                 return
             self.scroll_interval = interval
+        elif kind == "checkpoint_status":
+            source = Path(message["input"])
+            output = Path(message["output"])
+            limit = int(message.get("chunkLimit", 275000))
+            if not source.is_file():
+                self.emit("checkpoint_status", {"exists": False})
+                return
+            try:
+                source_text = source.read_text(encoding="utf-8")
+                from novel_translator.text_processing import split_text
+                chunks = split_text(source_text, limit)
+                progress_dir = checkpoint_dir_for(output)
+                fingerprint = source_fingerprint(f"{limit}\0{source_text}")
+                completed = load_checkpoint(progress_dir, fingerprint, len(chunks))
+                self.emit("checkpoint_status", {"exists": bool(completed), "completed": len(completed), "total": len(chunks)})
+            except Exception:
+                self.emit("checkpoint_status", {"exists": False})
         elif kind == "start":
             if self.thread and self.thread.is_alive():
                 raise ValueError("A translation is already running.")
+            errors = _validate_start_command(message)
+            if errors:
+                raise ValueError(errors[0])
             source = Path(message["input"])
             output = Path(message["output"])
-            if not source.is_file():
-                raise ValueError(f"Source file not found: {source}")
-            if source.suffix.lower() != ".txt":
-                raise ValueError(f"Source must be a TXT file: {source}")
-            if output.suffix.lower() != ".epub" or not output.parent.is_dir():
-                raise ValueError("Choose an EPUB destination in an existing folder.")
             limit = int(message.get("chunkLimit", 275000))
-            if limit not in (125000, 275000, 450000):
-                raise ValueError("Unknown chunk preset.")
             interval = float(message.get("scrollInterval", 0.5))
             remaining_limit = message.get("remainingChineseLimit", 50)
-            if type(remaining_limit) is not int or remaining_limit < 0:
-                raise ValueError("Chinese character tolerance must be a nonnegative whole number.")
             sweeps = message.get("sweeps", 2)
-            if not 0.1 <= interval <= 5:
-                raise ValueError("Scroll interval must be between 0.1 and 5 seconds.")
-            if type(sweeps) is not int or not 1 <= sweeps <= 10:
-                raise ValueError("Scroll passes must be a whole number between 1 and 10.")
             self.cancel.clear()
             self.scroll_interval = interval
             self.pause.set()
@@ -118,6 +132,31 @@ class Bridge:
                 self.emit("idle", None)
             else:
                 self.emit(event.kind, event.value)
+
+
+def _validate_start_command(message):
+    errors = []
+    source = Path(message["input"])
+    output = Path(message["output"])
+    if not source.is_file():
+        errors.append(f"Source file not found: {source}")
+    elif source.suffix.lower() != ".txt":
+        errors.append(f"Source must be a TXT file: {source}")
+    if output.suffix.lower() != ".epub" or not output.parent.is_dir():
+        errors.append("Choose an EPUB destination in an existing folder.")
+    limit = int(message.get("chunkLimit", 275000))
+    if limit not in CHUNK_PRESETS.values():
+        errors.append("Unknown chunk preset.")
+    remaining_limit = message.get("remainingChineseLimit", 50)
+    if type(remaining_limit) is not int or remaining_limit < 0:
+        errors.append("Chinese character tolerance must be a nonnegative whole number.")
+    sweeps = message.get("sweeps", 2)
+    interval = float(message.get("scrollInterval", 0.5))
+    if not 0.1 <= interval <= 5:
+        errors.append("Scroll interval must be between 0.1 and 5 seconds.")
+    if type(sweeps) is not int or not 1 <= sweeps <= 10:
+        errors.append("Scroll passes must be a whole number between 1 and 10.")
+    return errors
 
 
 def main():

@@ -7,12 +7,14 @@
   "scripts": {
     "start": "electron .",
     "check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check src/app.js",
+    "lint": "eslint --max-warnings 0 electron src",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win nsis"
   },
   "devDependencies": {
     "electron": "^44.5.1",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "eslint": "^9.39.5"
   },
   "build": {
     "appId": "io.noveltl.desktop",

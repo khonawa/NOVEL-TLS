@@ -29,6 +29,10 @@ html[data-theme="night"] pre { background: #171c19; }
 html[data-theme="night"] label, html[data-theme="night"] .eyebrow, html[data-theme="night"] .brand span, html[data-theme="night"] #connection, html[data-theme="night"] .metrics span, html[data-theme="night"] .chunk span, html[data-theme="night"] .empty { color: #afc0b6; }
 html[data-theme="night"] #notice { color: #edc28c; }
 html[data-theme="night"] .chunk { border-color: var(--line); }
+.checkpoint-status { font-size: 12px; color: #176b56; margin: 12px 0 0; min-height: 18px; }
+html[data-theme="night"] .checkpoint-status { color: #75c7a8; }
+.stats { font-size: 12px; color: #60776a; margin: 12px 0 18px; min-height: 18px; }
+html[data-theme="night"] .stats { color: #afc0b6; }
 @media (max-width: 760px) {
 	header { flex-wrap: wrap; padding: 20px; }
 	main { padding: 24px 20px; }

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Notification } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -8,9 +8,14 @@ let worker;
 let busy = false;
 let result;
 let folders = {};
+let allowedPaths = {};
 function rememberFolder(kind, selected) {
   folders[kind] = path.dirname(selected);
-  fs.writeFileSync(path.join(app.getPath('userData'), 'folders.json'), JSON.stringify(folders));
+  try {
+    fs.writeFileSync(path.join(app.getPath('userData'), 'folders.json'), JSON.stringify(folders));
+  } catch (error) {
+    send('log', `Could not save folder preference: ${error.message}`);
+  }
 }
 const send = (kind, value) => { if (window && !window.isDestroyed()) window.webContents.send('event', { kind, value }); };
 
@@ -24,11 +29,25 @@ function startWorker() {
     try {
       const event = JSON.parse(line);
       if (event.kind === 'idle' || event.kind === 'command_error') busy = false;
-      if (event.kind === 'done') result = String(event.value);
+      if (event.kind === 'done') {
+        result = String(event.value);
+        window?.setProgressBar(-1);
+        if (!window?.isFocused() && Notification.isSupported()) {
+          new Notification({ title: 'NovelTL', body: 'Translation complete' }).show();
+        }
+      }
+      if (event.kind === 'incomplete' || event.kind === 'error') window?.setProgressBar(-1);
+      if (event.kind === 'validation') {
+        window?.setProgressBar(2);
+        if (!window?.isFocused() && Notification.isSupported()) {
+          new Notification({ title: 'NovelTL', body: 'Translation needs review' }).show();
+        }
+      }
+      if (event.kind === 'progress' && typeof event.value === 'number') window?.setProgressBar(event.value);
       send(event.kind, event.value);
     } catch { send('log', line); }
   });
-  worker.stderr.on('data', data => send('log', data.toString()));
+  readline.createInterface({ input: worker.stderr }).on('line', line => send('log', line));
   worker.stdin.on('error', error => send('error', error.message));
   worker.on('error', error => send('error', `Python could not start: ${error.message}`));
   worker.on('close', code => { worker = null; busy = false; send('offline', `Backend exited (${code}). Check Python dependencies.`); });
@@ -50,23 +69,48 @@ app.whenReady().then(() => {
   });
 });
 
-ipcMain.handle('pick', async (_, kind, name) => {
+ipcMain.handle('pick', async (_, kind) => {
   if (kind === 'input') {
     const selected = await dialog.showOpenDialog(window, { defaultPath: folders.input, properties: ['openFile'], filters: [{ name: 'Novel text', extensions: ['txt'] }] });
-    if (!selected.canceled) rememberFolder('input', selected.filePaths[0]);
+    if (!selected.canceled) {
+      rememberFolder('input', selected.filePaths[0]);
+      allowedPaths.input = selected.filePaths[0];
+    }
     return selected.canceled ? null : selected.filePaths[0];
   }
   if (kind !== 'output') throw new Error('Invalid picker');
-  const filename = typeof name === 'string' ? path.basename(name).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') : 'Translation.epub';
-  const selected = await dialog.showSaveDialog(window, { defaultPath: path.join(folders.output || app.getPath('documents'), filename), filters: [{ name: 'EPUB book', extensions: ['epub'] }] });
-  if (!selected.canceled) rememberFolder('output', selected.filePath);
-  return selected.canceled ? null : selected.filePath;
+  const selected = await dialog.showOpenDialog(window, { defaultPath: folders.output || app.getPath('documents'), properties: ['openDirectory'] });
+  if (!selected.canceled) {
+    folders.output = selected.filePaths[0];
+    try {
+      fs.writeFileSync(path.join(app.getPath('userData'), 'folders.json'), JSON.stringify(folders));
+    } catch (error) {
+      send('log', `Could not save folder preference: ${error.message}`);
+    }
+    allowedPaths.output = selected.filePaths[0];
+  }
+  return selected.canceled ? null : selected.filePaths[0];
+});
+ipcMain.handle('default-output', () => {
+  const folder = folders.output;
+  if (!folder || !fs.statSync(folder, { throwIfNoEntry: false })?.isDirectory()) return null;
+  allowedPaths.output = folder;
+  return folder;
+});
+ipcMain.handle('drop-input', (_, filePath) => {
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || path.extname(filePath).toLowerCase() !== '.txt') throw new Error('Only .txt files can be dropped');
+  if (!fs.statSync(filePath, { throwIfNoEntry: false })?.isFile()) throw new Error('Dropped file is not accessible');
+  rememberFolder('input', filePath);
+  allowedPaths.input = filePath;
+  return filePath;
 });
 ipcMain.handle('command', (_, message) => {
   if (!worker || !worker.stdin.writable) throw new Error('Python backend is unavailable. Restart after installing dependencies.');
-  if (!message || !['start', 'pause', 'resume', 'cancel', 'decision', 'settings'].includes(message.kind)) throw new Error('Invalid command');
+  if (!message || !['start', 'pause', 'resume', 'cancel', 'decision', 'settings', 'checkpoint_status'].includes(message.kind)) throw new Error('Invalid command');
   if (message.kind === 'start') {
     if (busy) throw new Error('A run is already active');
+    if (message.input !== allowedPaths.input) throw new Error('Source path does not match the file picker selection');
+    if (typeof message.output !== 'string' || !allowedPaths.output || path.dirname(message.output) !== allowedPaths.output || path.extname(message.output).toLowerCase() !== '.epub') throw new Error('Destination must be an .epub file in the selected folder');
     busy = true;
     result = null;
   }
@@ -76,5 +120,16 @@ ipcMain.handle('open-result', async (_, folder) => {
   if (!result || !fs.existsSync(result)) throw new Error('No completed EPUB is available');
   if (folder) shell.showItemInFolder(result);
   else { const error = await shell.openPath(result); if (error) throw new Error(error); }
+});
+ipcMain.handle('restart-backend', () => {
+  if (worker) {
+    worker.stdin.end();
+    worker = null;
+  }
+  busy = false;
+  result = null;
+  allowedPaths.input = null;
+  allowedPaths.output = folders.output && fs.statSync(folders.output, { throwIfNoEntry: false })?.isDirectory() ? folders.output : null;
+  startWorker();
 });
 app.on('window-all-closed', () => app.quit());

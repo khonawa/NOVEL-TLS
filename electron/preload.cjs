@@ -1,7 +1,23 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+const listeners = [];
 contextBridge.exposeInMainWorld('desktop', {
-  pick: (kind, name) => ipcRenderer.invoke('pick', kind, name),
+  pick: kind => ipcRenderer.invoke('pick', kind),
+  defaultOutput: () => ipcRenderer.invoke('default-output'),
+  // File.path was removed in Electron 32; webUtils is the supported replacement.
+  dropInput: file => ipcRenderer.invoke('drop-input', webUtils.getPathForFile(file)),
   command: message => ipcRenderer.invoke('command', message),
   openResult: folder => ipcRenderer.invoke('open-result', folder),
-  onEvent: callback => { ipcRenderer.on('event', (_, event) => callback(event)); }
+  restartBackend: () => ipcRenderer.invoke('restart-backend'),
+  onEvent: callback => {
+    const handler = (_, event) => callback(event);
+    listeners.push(handler);
+    ipcRenderer.on('event', handler);
+    return () => {
+      const index = listeners.indexOf(handler);
+      if (index >= 0) {
+        listeners.splice(index, 1);
+        ipcRenderer.removeListener('event', handler);
+      }
+    };
+  }
 });

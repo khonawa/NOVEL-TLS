@@ -135,6 +135,10 @@ def _parse_cn_number(cn: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+_BARE_NUMBER_TITLE_RE = re.compile(r"^\[?\d")
+_HAS_WORD_RE = re.compile(r"[^\W\d_]")
+
+
 def _tier1_find(text: str) -> list[tuple[int, int, str]]:
     """Return ``(start, end, title)`` for every Tier-1 regex match.
 
@@ -147,6 +151,9 @@ def _tier1_find(text: str) -> list[tuple[int, int, str]]:
         raw_title = m.group(1) if m.lastindex else m.group(0)
         title = re.sub(r"\s+", " ", raw_title.strip())
         results.append((m.start(), m.end(), title))
+    # Numbered list items ("2. Some point") are not chapters when keyword headings exist.
+    if any(not _BARE_NUMBER_TITLE_RE.match(title) for _, _, title in results):
+        results = [r for r in results if not _BARE_NUMBER_TITLE_RE.match(r[2])]
     return results
 
 
@@ -182,12 +189,20 @@ def _tier2_find(text: str, existing: set[int]) -> list[tuple[int, int, str]]:
             continue
         if not _is_isolated(lines, idx):
             continue
+        # Scene breaks like "*** *** ***" or "=====" carry no words.
+        if not _HAS_WORD_RE.search(stripped):
+            continue
 
         # A line qualifies when at least one structural indicator fires.
         is_numeric = bool(HEADER_NUMERIC_RE.match(stripped))
         is_markdown = bool(HEADER_MARKDOWN_RE.match(stripped))
         is_wrapped = bool(HEADER_SYMBOL_WRAP_RE.match(stripped))
-        is_allcaps = bool(HEADER_ALLCAPS_RE.match(stripped)) and len(stripped) < 40
+        is_allcaps = (
+            bool(HEADER_ALLCAPS_RE.match(stripped))
+            and len(stripped) < 40
+            and len(_HAS_WORD_RE.findall(stripped)) >= 4
+            and not stripped.endswith((".", "!", "?"))
+        )
 
         if not (is_numeric or is_markdown or is_wrapped or is_allcaps):
             continue
@@ -283,16 +298,9 @@ def _tier3_repair(
 def _find_gap_candidate(
     block: str, target: int,
 ) -> tuple[int, int, str] | None:
-    """Search *block* for a line that likely represents chapter *target*.
-
-    Strategy:
-    1. Exact digit match with GAP_NUMBER_RE.
-    2. Shortest isolated line as a last-resort heuristic.
-    """
+    """Search *block* for a line that explicitly carries chapter number *target*."""
     lines = block.splitlines(keepends=True)
     offset = 0
-    best_shortest: tuple[int, int, str] | None = None
-    best_shortest_len = 80  # must be shorter than this to be considered
 
     for raw in lines:
         stripped = raw.strip()
@@ -302,18 +310,12 @@ def _find_gap_candidate(
         if not stripped or len(stripped) >= 80:
             continue
 
-        # Check exact number first.
         m = GAP_NUMBER_RE.match(stripped)
         if m and int(m.group(1)) == target:
             title = re.sub(r"\s+", " ", stripped)
             return (line_start, line_start + len(raw), title)
 
-        # Track shortest isolated line.
-        if len(stripped) < best_shortest_len:
-            best_shortest = (line_start, line_start + len(raw), re.sub(r"\s+", " ", stripped))
-            best_shortest_len = len(stripped)
-
-    return best_shortest
+    return None
 
 
 # ---------------------------------------------------------------------------
