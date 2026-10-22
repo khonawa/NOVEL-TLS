@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import html
+import io
 import re
 import time
 from pathlib import Path
 
 from ebooklib import epub
+from PIL import Image, ImageDraw, ImageFont
 
 from .constants import (
     CHAPTER_NUMBER_WORDS,
@@ -139,6 +141,43 @@ _BARE_NUMBER_TITLE_RE = re.compile(r"^\[?\d")
 _HAS_WORD_RE = re.compile(r"[^\W\d_]")
 
 
+def _has_list_neighbor(block: str, line_start: int, target: int) -> bool:
+    """True when ``target-1`` or ``target+1`` also starts a nearby line (a numbered list)."""
+    window = block[max(0, line_start - 600): line_start + 600]
+    pattern = rf"(?m)^[ \t]*\[?(?:{target - 1}|{target + 1})\]?[ \t]*[.)\-:][ \t]+\S"
+    return bool(re.search(pattern, window))
+
+
+def _drop_numbered_lists(entries: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
+    """Remove bare-number headings that restart numbering mid-book.
+
+    In "1. Start, 2. Middle, 1. Skirt, 2. Gown, 3. Dress, 3. End" the run
+    1-2-3 restarts below the last chapter number, so it is a list in prose.
+    """
+    result: list[tuple[int, int, str]] = []
+    last = 0
+    run_prev: int | None = None
+    for entry in entries:
+        num = _chapter_number(entry[2]) if _BARE_NUMBER_TITLE_RE.match(entry[2]) else None
+        if num is None:
+            run_prev = None
+            keyword_num = _chapter_number(entry[2])
+            if keyword_num is not None:
+                last = keyword_num
+            result.append(entry)
+            continue
+        if run_prev is not None and num == run_prev + 1:
+            run_prev = num
+            continue
+        if last and num <= last:
+            run_prev = num
+            continue
+        run_prev = None
+        last = num
+        result.append(entry)
+    return result
+
+
 def _tier1_find(text: str) -> list[tuple[int, int, str]]:
     """Return ``(start, end, title)`` for every Tier-1 regex match.
 
@@ -169,11 +208,12 @@ def _is_isolated(lines: list[str], idx: int) -> bool:
     return prev_blank and next_blank
 
 
-def _tier2_find(text: str, existing: set[int]) -> list[tuple[int, int, str]]:
+def _tier2_find(text: str, existing: set[int], strict: bool = False) -> list[tuple[int, int, str]]:
     """Find structural headers that Tier 1 may have missed.
 
     *existing* is a set of character offsets already claimed by Tier 1 so we
-    don't double-detect the same line.
+    don't double-detect the same line. *strict* accepts only markdown or
+    symbol-wrapped headers.
     """
     lines = text.splitlines(keepends=True)
     results: list[tuple[int, int, str]] = []
@@ -205,6 +245,10 @@ def _tier2_find(text: str, existing: set[int]) -> list[tuple[int, int, str]]:
         )
 
         if not (is_numeric or is_markdown or is_wrapped or is_allcaps):
+            continue
+        # With real keyword headings present, only explicit markup counts;
+        # numbered or shouted prose lines are not missing chapters.
+        if strict and not (is_markdown or is_wrapped):
             continue
 
         title = re.sub(r"\s+", " ", stripped)
@@ -311,7 +355,7 @@ def _find_gap_candidate(
             continue
 
         m = GAP_NUMBER_RE.match(stripped)
-        if m and int(m.group(1)) == target:
+        if m and int(m.group(1)) == target and not _has_list_neighbor(block, line_start, target):
             title = re.sub(r"\s+", " ", stripped)
             return (line_start, line_start + len(raw), title)
 
@@ -344,10 +388,11 @@ def split_chapters(text: str) -> list[tuple[str, str]]:
         # Heuristic: fewer than one chapter per 20 000 characters is sparse.
         avg_chars = len(text) / len(tier1)
         if avg_chars > 20_000:
-            tier2 = _tier2_find(text, {start for start, _, _ in tier1})
+            has_keyword = any(not _BARE_NUMBER_TITLE_RE.match(t) for _, _, t in tier1)
+            tier2 = _tier2_find(text, {start for start, _, _ in tier1}, strict=has_keyword)
 
     # Merge tiers and sort by position.
-    combined = sorted(tier1 + tier2, key=lambda t: t[0])
+    combined = _drop_numbered_lists(sorted(tier1 + tier2, key=lambda t: t[0]))
 
     # -- Tier 3 (repair) ----------------------------------------------------
     combined = _tier3_repair(text, combined)
@@ -367,12 +412,26 @@ def split_chapters(text: str) -> list[tuple[str, str]]:
     return chapters
 
 
-def make_epub(text: str, output: Path, book_title: str) -> None:
+def make_epub(text: str, output: Path, book_title: str, cover_options: dict | None = None) -> None:
+    if cover_options is None:
+        cover_options = {"mode": "auto", "textColor": "#ffffff", "bgColor": "#0f131c"}
+    
     book = epub.EpubBook()
     book.set_identifier(f"local-translation-{int(time.time())}")
     book.set_title(book_title)
     book.set_language("en")
     book.add_author("Translated locally with Chrome")
+    
+    # Generate or import cover image
+    if cover_options["mode"] == "auto":
+        cover_bytes = _generate_text_cover(book_title, cover_options.get("textColor", "#ffffff"), cover_options.get("bgColor", "#0f131c"))
+        book.set_cover("cover.jpg", cover_bytes)
+    elif cover_options["mode"] == "import" and cover_options.get("imagePath"):
+        try:
+            cover_bytes = Path(cover_options["imagePath"]).read_bytes()
+            book.set_cover("cover.jpg", cover_bytes)
+        except Exception:
+            pass
 
     items: list[epub.EpubHtml] = []
     toc: list[object] = []
@@ -386,12 +445,62 @@ def make_epub(text: str, output: Path, book_title: str) -> None:
             current_volume = None
             current_volume_children = []
 
+    def clean_chapter_title(title: str) -> str:
+        """Remove book title prefix from chapter titles.
+        Handles patterns like 'Book Title: 1.' or 'Book Title 1-140: 2.'"""
+        colon_pos = title.find(': ')
+        if colon_pos != -1:
+            after_colon = title[colon_pos + 2:].strip()
+            if after_colon and (after_colon[0].isdigit() or after_colon.lower().startswith(('chapter', 'prologue', 'epilogue'))):
+                return after_colon
+        return title
+
     for index, (title, body) in enumerate(split_chapters(text), start=1):
+        title = clean_chapter_title(title)
         chapter = epub.EpubHtml(title=title, file_name=f"chapter_{index:04d}.xhtml", lang="en")
-        paragraphs = "".join(
-            f"<p>{html.escape(line.strip())}</p>" for line in body.splitlines() if line.strip()
-        )
-        chapter.content = f"<h1>{html.escape(title)}</h1>{paragraphs}"
+        
+        # Build paragraphs with special handling for numbered lists
+        # Group consecutive numbered lines into a single <p> with <br> to prevent TOC detection
+        para_list = []
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            
+            # Check if this line starts with digit + period
+            is_numbered = False
+            if len(line) > 1 and line[0].isdigit():
+                period_pos = line.find('.')
+                if 0 < period_pos <= 2 and line[:period_pos].isdigit():
+                    line_number = int(line[:period_pos])
+                    if line_number <= 9:
+                        is_numbered = True
+            
+            if is_numbered:
+                # Collect all consecutive numbered lines
+                numbered_group = []
+                while i < len(lines):
+                    curr_line = lines[i]
+                    if len(curr_line) > 1 and curr_line[0].isdigit():
+                        p_pos = curr_line.find('.')
+                        if 0 < p_pos <= 2 and curr_line[:p_pos].isdigit():
+                            num = int(curr_line[:p_pos])
+                            if num <= 9:
+                                numbered_group.append(html.escape(curr_line))
+                                i += 1
+                                continue
+                    break
+                # Put all numbered items in ONE paragraph separated by <br>
+                if numbered_group:
+                    para_list.append(f"<p>{'<br/>'.join(numbered_group)}</p>")
+            else:
+                para_list.append(f"<p>{html.escape(line)}</p>")
+                i += 1
+        
+        paragraphs = "".join(para_list)
+        
+        chapter.content = f"<h1>{html.escape(title)}</h1><div class='content'>{paragraphs}</div>"
         book.add_item(chapter)
         items.append(chapter)
         if VOLUME_HEADING_RE.match(title):
@@ -409,7 +518,7 @@ def make_epub(text: str, output: Path, book_title: str) -> None:
     book.add_item(epub.EpubNav())
     style = epub.EpubItem(
         uid="style", file_name="style/main.css", media_type="text/css",
-        content=b"body{font-family:serif;line-height:1.6;margin:5%;}h1{text-align:center;}p{text-indent:1.5em;margin:.4em 0;}"
+        content=b"body{font-family:serif;line-height:1.6;margin:5%;}.content{display:block;}.content p{text-indent:1.5em;margin:.4em 0;display:block;}h1{text-align:center;}p{text-indent:1.5em;margin:.4em 0;}"
     )
     book.add_item(style)
     for item in items:
@@ -419,7 +528,64 @@ def make_epub(text: str, output: Path, book_title: str) -> None:
     # never leave a corrupt half-written EPUB at the destination.
     temporary = output.with_suffix(output.suffix + ".tmp")
     try:
-        epub.write_epub(str(temporary), book, {})
+        epub.write_epub(str(temporary), book, {'epub3_landmark': False, 'epub3_pages': False})
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _generate_text_cover(title: str, text_color: str, bg_color: str) -> bytes:
+    """Generate a simple text-only cover image with title centered on colored background."""
+    width, height = 800, 1200
+    img = Image.new("RGB", (width, height), color=bg_color)
+    draw = ImageDraw.Draw(img)
+    
+    # Try to load a large font; fallback to default if not found
+    try:
+        font = ImageFont.truetype("arial.ttf", 60)
+    except Exception:
+        font = ImageFont.load_default()
+    
+    # Word wrap the title if it's too long
+    words = title.split()
+    lines = []
+    current_line = []
+    
+    for word in words:
+        test_line = " ".join(current_line + [word])
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        if bbox[2] - bbox[0] <= width - 100:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [word]
+    
+    if current_line:
+        lines.append(" ".join(current_line))
+    
+    # Calculate total height and vertical centering
+    total_height = 0
+    line_heights = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_height = bbox[3] - bbox[1]
+        line_heights.append(line_height)
+        total_height += line_height
+    
+    line_spacing = 20
+    total_height += line_spacing * (len(lines) - 1)
+    
+    y = (height - total_height) // 2
+    
+    # Draw each line centered
+    for line, line_height in zip(lines, line_heights):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        text_width = bbox[2] - bbox[0]
+        x = (width - text_width) // 2
+        draw.text((x, y), line, fill=text_color, font=font)
+        y += line_height + line_spacing
+    
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()

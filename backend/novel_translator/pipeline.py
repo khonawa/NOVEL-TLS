@@ -149,9 +149,9 @@ class PipelineContext:
     get_scroll_interval: Callable[[], float]
     get_required_sweeps: Callable[[], int]
     remaining_chinese_limit: int = field(default=0, kw_only=True)
-    # Returns "retry" | "accept" | "skip" for a chunk that failed validation.
     request_validation: Callable[[int, str], str]
     chunk_limit: int = field(default_factory=lambda: CHUNK_PRESETS["Balanced (275k)"])
+    cover_options: dict = field(default_factory=lambda: {"mode": "auto", "textColor": "#ffffff", "bgColor": "#0f131c"})
 
 
 class TranslationRunner:
@@ -373,7 +373,7 @@ class TranslationRunner:
             self._emit("status", "Building EPUB")
             make_epub(
                 "\n\n".join(completed[index] for index in range(1, len(chunks) + 1)),
-                output_path, sanitize_filename(input_path.stem),
+                output_path, output_path.stem, cover_options=self.ctx.cover_options,
             )
             shutil.rmtree(progress_dir, ignore_errors=True)
             self._emit("done", str(output_path))

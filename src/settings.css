@@ -16,6 +16,8 @@ input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px s
 .toggle input { flex: none; width: 16px; height: 16px; accent-color: var(--accent); }
 #name { width: 100%; }
 #chinese-limit { width: 100%; }
+#custom-chunk-wrapper { margin: 12px 0 0; }
+#custom-chunk { width: 100%; }
 .scroll-settings { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .scroll-settings input { width: 100%; min-width: 0; }
 #scroll-slider { display: block; height: 28px; padding: 0; margin: 8px 0 0; accent-color: var(--accent); cursor: pointer; }
@@ -33,6 +35,13 @@ html[data-theme="night"] .chunk { border-color: var(--line); }
 html[data-theme="night"] .checkpoint-status { color: #75c7a8; }
 .stats { font-size: 12px; color: #60776a; margin: 12px 0 18px; min-height: 18px; }
 html[data-theme="night"] .stats { color: #afc0b6; }
+.cover-mode { display: flex; gap: 1.5rem; margin-bottom: 1rem; }
+.cover-mode label { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
+#cover-auto, #cover-import { display: flex; flex-direction: column; gap: 0.75rem; }
+#cover-canvas { border: 1px solid var(--line); border-radius: 4px; max-width: 100%; height: auto; cursor: crosshair; }
+#crop-controls { display: flex; gap: 0.5rem; }
+.configuration h3 { margin: 1.5rem 0 0.75rem; font-size: 0.9375rem; font-weight: 600; letter-spacing: 0.02em; color: #0d3d2f; }
+html[data-theme="night"] .configuration h3 { color: #e1e8e4; }
 @media (max-width: 760px) {
 	header { flex-wrap: wrap; padding: 20px; }
 	main { padding: 24px 20px; }

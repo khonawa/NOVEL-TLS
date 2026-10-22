@@ -78,6 +78,14 @@ ipcMain.handle('pick', async (_, kind) => {
     }
     return selected.canceled ? null : selected.filePaths[0];
   }
+  if (kind === 'image') {
+    const selected = await dialog.showOpenDialog(window, { defaultPath: folders.cover, properties: ['openFile'], filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }] });
+    if (!selected.canceled) {
+      rememberFolder('cover', selected.filePaths[0]);
+      allowedPaths.cover = selected.filePaths[0];
+    }
+    return selected.canceled ? null : selected.filePaths[0];
+  }
   if (kind !== 'output') throw new Error('Invalid picker');
   const selected = await dialog.showOpenDialog(window, { defaultPath: folders.output || app.getPath('documents'), properties: ['openDirectory'] });
   if (!selected.canceled) {

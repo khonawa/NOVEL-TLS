@@ -13,6 +13,7 @@ APP_VERSION = "1.1.0"
 # preset is selected (and the default value of split_text's ``limit``).
 DEFAULT_CHUNK_LIMIT = 275_000
 CHUNK_PRESETS = {
+    "Ultra Safe (60k)": 60_000,
     "Reliable (125k)": 125_000,
     "Balanced (275k)": DEFAULT_CHUNK_LIMIT,
     "Fast (450k)": 450_000,

@@ -7,6 +7,8 @@ let started = 0;
 let logs = [];
 let currentStats = { speed: null, eta: null, currentPct: 0 };
 let outputFolder = '';
+let coverImage = null;
+let cropState = null;
 
 loadSettings();
 applyTheme();
@@ -17,12 +19,35 @@ element('original-name').onchange = () => {
   syncOutput();
 };
 element('name').oninput = () => { element('original-name').checked = false; localStorage.setItem('original-name', 'false'); syncOutput(); };
-element('preset').onchange = () => { localStorage.setItem('preset', element('preset').value); checkForCheckpoint(); };
+element('preset').onchange = () => {
+  const isCustom = element('preset').value === 'custom';
+  element('custom-chunk-wrapper').style.display = isCustom ? 'block' : 'none';
+  if (isCustom) {
+    const saved = localStorage.getItem('custom-chunk');
+    if (saved && !isNaN(saved)) element('custom-chunk').value = saved;
+    element('custom-chunk').focus();
+  }
+  localStorage.setItem('preset', element('preset').value);
+  checkForCheckpoint();
+  controls();
+};
+element('custom-chunk').oninput = () => {
+  if (element('custom-chunk').checkValidity()) {
+    localStorage.setItem('custom-chunk', element('custom-chunk').value);
+  }
+  controls();
+};
 for (const id of ['scroll-interval', 'scroll-slider']) element(id).oninput = syncScroll;
 element('chinese-limit').oninput = () => {
   if (element('chinese-limit').checkValidity()) localStorage.setItem('chinese-limit', element('chinese-limit').value);
   controls();
 };
+for (const radio of document.querySelectorAll('[name="cover-mode"]')) radio.onchange = toggleCoverMode;
+element('cover-text-color').oninput = () => localStorage.setItem('cover-text-color', element('cover-text-color').value);
+element('cover-bg-color').oninput = () => localStorage.setItem('cover-bg-color', element('cover-bg-color').value);
+element('pick-cover').onclick = pickCoverImage;
+element('crop-apply').onclick = applyCrop;
+element('crop-reset').onclick = resetCrop;
 for (const kind of ['input', 'output']) element(`pick-${kind}`).onclick = () => pickFile(kind);
 element('start').onclick = start;
 element('pause').onclick = togglePause;
@@ -47,12 +72,24 @@ if (api) {
 controls();
 
 function loadSettings() {
-  element('preset').value = localStorage.getItem('preset') || '275000';
+  const savedPreset = localStorage.getItem('preset');
+  const validPresets = ['60000', '125000', '275000', '450000', 'custom'];
+  element('preset').value = validPresets.includes(savedPreset) ? savedPreset : '275000';
+  if (savedPreset === 'custom') {
+    element('custom-chunk-wrapper').style.display = 'block';
+    const savedCustom = localStorage.getItem('custom-chunk');
+    if (savedCustom) element('custom-chunk').value = savedCustom;
+  }
   element('night').checked = localStorage.getItem('theme') === 'night';
   element('original-name').checked = localStorage.getItem('original-name') !== 'false';
   element('scroll-interval').value = localStorage.getItem('scroll-interval') || '0.5';
   element('scroll-slider').value = element('scroll-interval').value;
   element('chinese-limit').value = localStorage.getItem('chinese-limit') || '50';
+  const savedCoverMode = localStorage.getItem('cover-mode') || 'auto';
+  document.querySelector(`[name="cover-mode"][value="${savedCoverMode}"]`).checked = true;
+  toggleCoverMode();
+  element('cover-text-color').value = localStorage.getItem('cover-text-color') || '#ffffff';
+  element('cover-bg-color').value = localStorage.getItem('cover-bg-color') || '#0f131c';
 }
 
 function applyTheme() {
@@ -65,6 +102,14 @@ function sourceName() {
 
 function outputName() {
   return element('name').value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '').replace(/\.epub$/i, '');
+}
+
+function getChunkSize() {
+  const preset = element('preset').value;
+  if (preset === 'custom') {
+    return Number(element('custom-chunk').value) || 275000;
+  }
+  return Number(preset);
 }
 
 function syncOutput() {
@@ -96,8 +141,9 @@ function setNotice(message, color) {
 }
 
 function controls() {
-  element('start').disabled = !ready || busy || !element('input').value || !element('output').value || !outputName() || !element('scroll-interval').value || !element('scroll-interval').checkValidity() || !element('chinese-limit').checkValidity();
-  for (const id of ['pick-input', 'pick-output', 'preset', 'name', 'original-name', 'chinese-limit']) element(id).disabled = !ready || busy;
+  const customChunkValid = element('preset').value !== 'custom' || (element('custom-chunk').value && element('custom-chunk').checkValidity());
+  element('start').disabled = !ready || busy || !element('input').value || !element('output').value || !outputName() || !element('scroll-interval').value || !element('scroll-interval').checkValidity() || !element('chinese-limit').checkValidity() || !customChunkValid;
+  for (const id of ['pick-input', 'pick-output', 'preset', 'name', 'original-name', 'chinese-limit', 'custom-chunk']) element(id).disabled = !ready || busy;
   for (const id of ['scroll-interval', 'scroll-slider']) element(id).disabled = !ready;
   element('pause').disabled = !busy;
   element('cancel').disabled = !busy;
@@ -137,7 +183,7 @@ async function checkForCheckpoint() {
     return;
   }
   try {
-    await command({ kind: 'checkpoint_status', input: element('input').value, output: element('output').value, chunkLimit: Number(element('preset').value) });
+    await command({ kind: 'checkpoint_status', input: element('input').value, output: element('output').value, chunkLimit: getChunkSize() });
   } catch {}
 }
 
@@ -146,7 +192,11 @@ async function start() {
   busy = true;
   paused = false;
   controls();
-  if (await command({ kind: 'start', input: element('input').value, output: element('output').value, chunkLimit: Number(element('preset').value), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value) })) {
+  const coverMode = document.querySelector('[name="cover-mode"]:checked').value;
+  const coverOptions = coverMode === 'auto'
+    ? { mode: 'auto', textColor: element('cover-text-color').value, bgColor: element('cover-bg-color').value }
+    : { mode: 'import', imagePath: coverImage || null };
+  if (await command({ kind: 'start', input: element('input').value, output: element('output').value, chunkLimit: getChunkSize(), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions })) {
     started = Date.now();
     element('status').textContent = 'Running';
     setNotice('');
@@ -343,4 +393,62 @@ function handleEvent({ kind, value }) {
     element('connection').textContent = 'Backend offline';
   }
   controls();
+}
+
+function toggleCoverMode() {
+  const mode = document.querySelector('[name="cover-mode"]:checked').value;
+  localStorage.setItem('cover-mode', mode);
+  element('cover-auto').style.display = mode === 'auto' ? 'flex' : 'none';
+  element('cover-import').style.display = mode === 'import' ? 'flex' : 'none';
+  coverImage = null;
+  cropState = null;
+  element('cover-file-name').textContent = '';
+  element('crop-controls').style.display = 'none';
+}
+
+async function pickCoverImage() {
+  if (!api) return;
+  const path = await api.pick({ mode: 'image' });
+  if (!path) return;
+  coverImage = path;
+  element('cover-file-name').textContent = path.split(/[/\\]/).pop();
+  const canvas = element('cover-canvas');
+  const ctx = canvas.getContext('2d');
+  const img = new Image();
+  img.onload = () => {
+    canvas.width = 400;
+    canvas.height = 600;
+    const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+    const w = img.width * scale;
+    const h = img.height * scale;
+    const x = (canvas.width - w) / 2;
+    const y = (canvas.height - h) / 2;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, x, y, w, h);
+    cropState = { img, x, y, w, h, cropX: 0, cropY: 0, cropW: w, cropH: h };
+    element('crop-controls').style.display = 'flex';
+  };
+  img.src = 'file://' + path;
+}
+
+function applyCrop() {
+  if (!cropState) return;
+  const canvas = element('cover-canvas');
+  const ctx = canvas.getContext('2d');
+  const { img, cropX, cropY, cropW, cropH } = cropState;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
+}
+
+function resetCrop() {
+  if (!cropState) return;
+  const canvas = element('cover-canvas');
+  const ctx = canvas.getContext('2d');
+  const { img, x, y, w, h } = cropState;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, x, y, w, h);
+  cropState.cropX = 0;
+  cropState.cropY = 0;
+  cropState.cropW = w;
+  cropState.cropH = h;
 }

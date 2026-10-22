@@ -79,6 +79,7 @@ class Bridge:
             interval = float(message.get("scrollInterval", 0.5))
             remaining_limit = message.get("remainingChineseLimit", 50)
             sweeps = message.get("sweeps", 2)
+            cover_options = message.get("cover", {"mode": "auto", "textColor": "#ffffff", "bgColor": "#0f131c"})
             self.cancel.clear()
             self.scroll_interval = interval
             self.pause.set()
@@ -92,6 +93,7 @@ class Bridge:
                 request_validation=self.decide,
                 chunk_limit=limit,
                 remaining_chinese_limit=remaining_limit,
+                cover_options=cover_options,
             )
             self.thread = threading.Thread(target=self.run, args=(context, source, output))
             self.thread.start()
