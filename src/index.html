@@ -7,19 +7,20 @@
   <section class="heading"><div><p class="eyebrow">LIBRARY</p><h1>New translation</h1></div><span class="badge">CHINESE → ENGLISH</span></section>
   <div class="workspace">
     <section class="configuration"><h2>Source & destination</h2>
-      <label for="input">Source novel</label><div class="file"><input id="input" readonly placeholder="No TXT selected"><button id="pick-input">Browse</button></div>
+      <div class="mode-selector"><label><input type="radio" name="mode" value="translate" checked>Translate text file</label><label><input type="radio" name="mode" value="fix">Fix EPUB file</label></div>
+      <label for="input" id="input-label">Source novel</label><div class="file"><input id="input" readonly placeholder="No file selected"><button id="pick-input">Browse</button></div>
       <label for="name">Translation name</label><input id="name" type="text" placeholder="Translation name" maxlength="180">
       <label class="toggle"><input id="original-name" type="checkbox" checked>Original name + EN</label>
       <label for="output">EPUB destination</label><div class="file"><input id="output" readonly placeholder="No destination selected"><button id="pick-output">Choose folder</button></div>
-      <label for="preset">Chunk size</label><select id="preset"><option value="60000">Ultra Safe · 60,000 characters</option><option value="125000">Reliable · 125,000 characters</option><option value="275000" selected>Balanced · 275,000 characters</option><option value="450000">Fast · 450,000 characters</option><option value="custom">Custom</option></select>
-      <div id="custom-chunk-wrapper" style="display: none;"><label for="custom-chunk">Custom chunk size</label><input id="custom-chunk" type="number" min="1000" max="1000000" step="1000" placeholder="Enter characters (e.g. 80000)"></div>
+      <div class="translate-only"><label for="preset">Chunk size</label><select id="preset"><option value="60000">Ultra Safe · 60,000 characters</option><option value="125000">Reliable · 125,000 characters</option><option value="275000" selected>Balanced · 275,000 characters</option><option value="450000">Fast · 450,000 characters</option><option value="custom">Custom</option></select>
+      <div id="custom-chunk-wrapper" style="display: none;"><label for="custom-chunk">Custom chunk size</label><input id="custom-chunk" type="number" min="1000" max="1000000" step="1000" placeholder="Enter characters (e.g. 80000)"></div></div>
       <h3>Cover image</h3>
       <div class="cover-mode"><label><input type="radio" name="cover-mode" value="auto" checked>Auto-generate</label><label><input type="radio" name="cover-mode" value="import">Import image</label></div>
       <div id="cover-auto"><label for="cover-text-color">Text color</label><input id="cover-text-color" type="color" value="#ffffff"><label for="cover-bg-color">Background</label><input id="cover-bg-color" type="color" value="#0f131c"></div>
-      <div id="cover-import" style="display: none;"><button id="pick-cover">Choose image</button><p id="cover-file-name"></p><canvas id="cover-canvas" width="400" height="600"></canvas><div id="crop-controls" style="display: none;"><button id="crop-apply">Apply crop</button><button id="crop-reset">Reset</button></div></div>
-      <div class="scroll-settings"><div><label for="scroll-interval">Scroll interval (seconds)</label><input id="scroll-interval" type="number" min="0.1" max="5" step="0.1" value="0.5" required><input id="scroll-slider" type="range" min="0.1" max="5" step="0.1" value="0.5" aria-label="Scroll interval in seconds"></div></div>
+      <div id="cover-import" style="display: none;"><button id="pick-cover">Choose image</button><p id="cover-file-name"></p><p id="crop-hint" class="crop-hint" style="display: none;">Drag to select the cover area (2:3). Drag inside the box to move it.</p><canvas id="cover-canvas" width="400" height="600"></canvas><div id="crop-controls" style="display: none;"><button id="crop-reset">Reset crop</button><button id="crop-full">Use whole image</button></div></div>
+      <div class="translate-only"><div class="scroll-settings"><div><label for="scroll-interval">Scroll interval (seconds)</label><input id="scroll-interval" type="number" min="0.1" max="5" step="0.1" value="0.5" required><input id="scroll-slider" type="range" min="0.1" max="5" step="0.1" value="0.5" aria-label="Scroll interval in seconds"></div></div>
       <label for="chinese-limit">Allowed Chinese characters per chunk</label><input id="chinese-limit" type="number" min="0" step="1" value="50" required>
-      <p id="checkpoint-status" class="checkpoint-status"></p>
+      <p id="checkpoint-status" class="checkpoint-status"></p></div>
       <div class="actions"><button class="primary" id="start" disabled>Start translation</button><button id="pause" disabled>Pause</button><button id="cancel" disabled>Cancel</button><button id="retry" disabled>Retry failed</button></div>
       <p id="notice" role="status">Waiting for backend.</p>
       <div class="result"><button id="open" disabled>Open EPUB</button><button id="folder" disabled>Show in folder</button><button id="restart-backend">Restart backend</button><button id="export-diagnostics">Export diagnostics</button></div>

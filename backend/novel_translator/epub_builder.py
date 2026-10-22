@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import io
+import logging
 import re
 import time
 from pathlib import Path
@@ -428,10 +429,10 @@ def make_epub(text: str, output: Path, book_title: str, cover_options: dict | No
         book.set_cover("cover.jpg", cover_bytes)
     elif cover_options["mode"] == "import" and cover_options.get("imagePath"):
         try:
-            cover_bytes = Path(cover_options["imagePath"]).read_bytes()
+            cover_bytes = _prepare_imported_cover(Path(cover_options["imagePath"]), cover_options.get("crop"))
             book.set_cover("cover.jpg", cover_bytes)
-        except Exception:
-            pass
+        except Exception as error:
+            logging.getLogger(__name__).warning("Could not use cover image: %s", error)
 
     items: list[epub.EpubHtml] = []
     toc: list[object] = []
@@ -532,6 +533,86 @@ def make_epub(text: str, output: Path, book_title: str, cover_options: dict | No
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _prepare_imported_cover(path: Path, crop: dict | None) -> bytes:
+    """Apply the optional crop and re-encode as JPEG so it matches cover.jpg."""
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        if crop:
+            left = max(0, int(crop.get("x", 0)))
+            top = max(0, int(crop.get("y", 0)))
+            right = min(image.width, left + int(crop.get("width", image.width)))
+            bottom = min(image.height, top + int(crop.get("height", image.height)))
+            if right - left >= 10 and bottom - top >= 10:
+                image = image.crop((left, top, right, bottom))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=92)
+        return buffer.getvalue()
+
+
+def read_epub_title(path: Path) -> str | None:
+    book = epub.read_epub(str(path), {"ignore_ncx": True})
+    titles = book.get_metadata("DC", "title")
+    if titles and titles[0][0]:
+        return str(titles[0][0]).strip() or None
+    return None
+
+
+_BLOCK_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "pre"}
+_FRONT_MATTER_RE = re.compile(r"(?i)(?:^|[\s/_\-.])(?:cover|titlepage|title[_\-]page|nav|toc)(?:[\s/_\-.]|$)")
+
+
+def extract_epub_text(path: Path) -> str:
+    """Flatten an existing EPUB back into plain text so it can be re-split.
+
+    Headings and paragraphs become blank-line separated blocks and <br/> becomes a
+    newline, mirroring the TXT layout that split_chapters() expects.
+    """
+    import ebooklib
+    from lxml import html as lxml_html
+
+    book = epub.read_epub(str(path), {"ignore_ncx": True})
+    blocks: list[str] = []
+    for item_id, _linear in book.spine:
+        item = book.get_item_with_id(item_id)
+        if item is None or item.get_type() != ebooklib.ITEM_DOCUMENT or isinstance(item, (epub.EpubNav, epub.EpubCoverHtml)):
+            continue
+        # Old cover/title pages carry the previous book name; a fresh cover replaces them.
+        if _FRONT_MATTER_RE.search(f"{item_id} {item.get_name()}"):
+            continue
+        content = item.get_content()
+        if not content or not content.strip():
+            continue
+        try:
+            root = lxml_html.fromstring(content)
+        except Exception:
+            continue
+        for br in root.iter("br"):
+            br.tail = "\n" + (br.tail or "")
+        body = root.find(".//body")
+        if body is None:
+            body = root
+        found = False
+        for element in body.iter():
+            if not isinstance(element.tag, str) or element.tag.lower() not in _BLOCK_TAGS:
+                continue
+            # Skip blocks nested inside another block (e.g. <p> inside <li>) to avoid duplicates.
+            if any(isinstance(a.tag, str) and a.tag.lower() in _BLOCK_TAGS for a in element.iterancestors()):
+                continue
+            found = True
+            text = "\n".join(line.strip() for line in element.text_content().splitlines())
+            text = re.sub(r"\n{2,}", "\n", text).strip()
+            if text:
+                blocks.append(text)
+        if not found:
+            text = body.text_content().strip()
+            if text:
+                blocks.append(text)
+    text = "\n\n".join(blocks).strip()
+    if not text:
+        raise ValueError("No readable text was found in the EPUB.")
+    return text
 
 
 def _generate_text_cover(title: str, text_color: str, bg_color: str) -> bytes:

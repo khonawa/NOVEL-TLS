@@ -13,9 +13,10 @@ let cropState = null;
 loadSettings();
 applyTheme();
 element('night').onchange = () => { applyTheme(); localStorage.setItem('theme', document.documentElement.dataset.theme); };
+for (const radio of document.querySelectorAll('[name="mode"]')) radio.onchange = toggleMode;
 element('original-name').onchange = () => {
   localStorage.setItem('original-name', element('original-name').checked);
-  if (element('original-name').checked && sourceName()) element('name').value = sourceName() + ' EN';
+  if (element('original-name').checked && sourceName()) element('name').value = sourceName() + nameSuffix();
   syncOutput();
 };
 element('name').oninput = () => { element('original-name').checked = false; localStorage.setItem('original-name', 'false'); syncOutput(); };
@@ -46,8 +47,9 @@ for (const radio of document.querySelectorAll('[name="cover-mode"]')) radio.onch
 element('cover-text-color').oninput = () => localStorage.setItem('cover-text-color', element('cover-text-color').value);
 element('cover-bg-color').oninput = () => localStorage.setItem('cover-bg-color', element('cover-bg-color').value);
 element('pick-cover').onclick = pickCoverImage;
-element('crop-apply').onclick = applyCrop;
 element('crop-reset').onclick = resetCrop;
+element('crop-full').onclick = useWholeImage;
+setupCropCanvas();
 for (const kind of ['input', 'output']) element(`pick-${kind}`).onclick = () => pickFile(kind);
 element('start').onclick = start;
 element('pause').onclick = togglePause;
@@ -85,6 +87,9 @@ function loadSettings() {
   element('scroll-interval').value = localStorage.getItem('scroll-interval') || '0.5';
   element('scroll-slider').value = element('scroll-interval').value;
   element('chinese-limit').value = localStorage.getItem('chinese-limit') || '50';
+  const savedMode = localStorage.getItem('mode') || 'translate';
+  document.querySelector(`[name="mode"][value="${savedMode}"]`).checked = true;
+  toggleMode();
   const savedCoverMode = localStorage.getItem('cover-mode') || 'auto';
   document.querySelector(`[name="cover-mode"][value="${savedCoverMode}"]`).checked = true;
   toggleCoverMode();
@@ -97,7 +102,30 @@ function applyTheme() {
 }
 
 function sourceName() {
-  return element('input').value.split(/[\\/]/).pop().replace(/\.txt$/i, '');
+  return element('input').value.split(/[\\/]/).pop().replace(/\.(txt|epub)$/i, '');
+}
+
+function isFixMode() {
+  return document.querySelector('[name="mode"]:checked')?.value === 'fix';
+}
+
+function toggleMode() {
+  const fix = isFixMode();
+  localStorage.setItem('mode', fix ? 'fix' : 'translate');
+  element('input-label').textContent = fix ? 'Translated EPUB to fix' : 'Source novel';
+  element('original-name').parentElement.lastChild.textContent = fix ? 'Original name + fixed' : 'Original name + EN';
+  for (const section of document.querySelectorAll('.translate-only')) section.hidden = fix;
+  element('start').textContent = fix ? 'Fix EPUB' : 'Start translation';
+  element('retry').hidden = fix;
+  element('pause').hidden = fix;
+  element('input').value = '';
+  element('checkpoint-status').textContent = '';
+  if (element('original-name').checked) element('name').value = '';
+  syncOutput();
+}
+
+function nameSuffix() {
+  return isFixMode() ? ' fixed' : ' EN';
 }
 
 function outputName() {
@@ -141,9 +169,13 @@ function setNotice(message, color) {
 }
 
 function controls() {
-  const customChunkValid = element('preset').value !== 'custom' || (element('custom-chunk').value && element('custom-chunk').checkValidity());
-  element('start').disabled = !ready || busy || !element('input').value || !element('output').value || !outputName() || !element('scroll-interval').value || !element('scroll-interval').checkValidity() || !element('chinese-limit').checkValidity() || !customChunkValid;
-  for (const id of ['pick-input', 'pick-output', 'preset', 'name', 'original-name', 'chinese-limit', 'custom-chunk']) element(id).disabled = !ready || busy;
+  const fix = isFixMode();
+  const customChunkValid = fix || element('preset').value !== 'custom' || (element('custom-chunk').value && element('custom-chunk').checkValidity());
+  const translateValid = fix || (element('scroll-interval').value && element('scroll-interval').checkValidity() && element('chinese-limit').checkValidity());
+  const coverValid = document.querySelector('[name="cover-mode"]:checked')?.value !== 'import' || Boolean(coverImage);
+  element('start').disabled = !ready || busy || !element('input').value || !element('output').value || !outputName() || !translateValid || !customChunkValid || !coverValid;
+  for (const id of ['pick-input', 'pick-output', 'preset', 'name', 'original-name', 'chinese-limit', 'custom-chunk', 'pick-cover']) element(id).disabled = !ready || busy;
+  for (const radio of document.querySelectorAll('[name="mode"], [name="cover-mode"]')) radio.disabled = busy;
   for (const id of ['scroll-interval', 'scroll-slider']) element(id).disabled = !ready;
   element('pause').disabled = !busy;
   element('cancel').disabled = !busy;
@@ -160,11 +192,11 @@ async function command(message) {
 
 async function pickFile(kind) {
   try {
-    const selected = await api.pick(kind);
+    const selected = await api.pick(kind === 'input' && isFixMode() ? 'epub' : kind);
     if (selected) {
       if (kind === 'input') {
         element('input').value = selected;
-        if (element('original-name').checked || !element('name').value) element('name').value = sourceName() + ' EN';
+        if (element('original-name').checked || !element('name').value) element('name').value = sourceName() + nameSuffix();
         syncOutput();
         checkForCheckpoint();
       } else {
@@ -178,7 +210,7 @@ async function pickFile(kind) {
 }
 
 async function checkForCheckpoint() {
-  if (!element('input').value || !outputFolder || !outputName()) {
+  if (isFixMode() || !element('input').value || !outputFolder || !outputName()) {
     element('checkpoint-status').textContent = '';
     return;
   }
@@ -195,8 +227,11 @@ async function start() {
   const coverMode = document.querySelector('[name="cover-mode"]:checked').value;
   const coverOptions = coverMode === 'auto'
     ? { mode: 'auto', textColor: element('cover-text-color').value, bgColor: element('cover-bg-color').value }
-    : { mode: 'import', imagePath: coverImage || null };
-  if (await command({ kind: 'start', input: element('input').value, output: element('output').value, chunkLimit: getChunkSize(), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions })) {
+    : { mode: 'import', imagePath: coverImage || null, crop: cropRegion() };
+  const message = isFixMode()
+    ? { kind: 'fix_epub', input: element('input').value, output: element('output').value, cover: coverOptions }
+    : { kind: 'start', input: element('input').value, output: element('output').value, chunkLimit: getChunkSize(), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions };
+  if (await command(message)) {
     started = Date.now();
     element('status').textContent = 'Running';
     setNotice('');
@@ -304,15 +339,16 @@ function setupDragDrop() {
   target.addEventListener('drop', async event => {
     event.preventDefault();
     if (!ready || busy) return;
-    const file = [...event.dataTransfer.files].find(f => f.name.toLowerCase().endsWith('.txt'));
-    if (!file) { setNotice('Drop a .txt file'); return; }
+    const wanted = isFixMode() ? '.epub' : '.txt';
+    const file = [...event.dataTransfer.files].find(f => f.name.toLowerCase().endsWith(wanted));
+    if (!file) { setNotice(`Drop a ${wanted} file`); return; }
     try {
       element('input').value = await api.dropInput(file);
     } catch (error) {
       setNotice(error.message);
       return;
     }
-    if (element('original-name').checked || !element('name').value) element('name').value = sourceName() + ' EN';
+    if (element('original-name').checked || !element('name').value) element('name').value = sourceName() + nameSuffix();
     syncOutput();
     await checkForCheckpoint();
     controls();
@@ -404,51 +440,125 @@ function toggleCoverMode() {
   cropState = null;
   element('cover-file-name').textContent = '';
   element('crop-controls').style.display = 'none';
+  element('crop-hint').style.display = 'none';
+  const canvas = element('cover-canvas');
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+  controls();
 }
 
 async function pickCoverImage() {
   if (!api) return;
-  const path = await api.pick({ mode: 'image' });
-  if (!path) return;
-  coverImage = path;
-  element('cover-file-name').textContent = path.split(/[/\\]/).pop();
-  const canvas = element('cover-canvas');
-  const ctx = canvas.getContext('2d');
-  const img = new Image();
-  img.onload = () => {
-    canvas.width = 400;
-    canvas.height = 600;
-    const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
-    const w = img.width * scale;
-    const h = img.height * scale;
-    const x = (canvas.width - w) / 2;
-    const y = (canvas.height - h) / 2;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, x, y, w, h);
-    cropState = { img, x, y, w, h, cropX: 0, cropY: 0, cropW: w, cropH: h };
-    element('crop-controls').style.display = 'flex';
-  };
-  img.src = 'file://' + path;
+  try {
+    const path = await api.pick('image');
+    if (!path) return;
+    const dataUrl = await api.coverPreview();
+    const img = new Image();
+    img.onload = () => {
+      coverImage = path;
+      element('cover-file-name').textContent = path.split(/[/\\]/).pop();
+      const canvas = element('cover-canvas');
+      const scale = Math.min(400 / img.width, 600 / img.height, 1);
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      cropState = { img, scale, crop: null, drag: null };
+      resetCrop();
+      element('crop-controls').style.display = 'flex';
+      element('crop-hint').style.display = 'block';
+      controls();
+    };
+    img.onerror = () => setNotice('Could not load the selected image');
+    img.src = dataUrl;
+  } catch (error) { setNotice(error.message); }
 }
 
-function applyCrop() {
+// Largest centered 2:3 rectangle (canvas pixels) that fits the image.
+function defaultCrop() {
+  const canvas = element('cover-canvas');
+  let w = canvas.width;
+  let h = w * 1.5;
+  if (h > canvas.height) { h = canvas.height; w = h / 1.5; }
+  return { x: (canvas.width - w) / 2, y: (canvas.height - h) / 2, w, h };
+}
+
+function drawCrop() {
   if (!cropState) return;
   const canvas = element('cover-canvas');
   const ctx = canvas.getContext('2d');
-  const { img, cropX, cropY, cropW, cropH } = cropState;
+  const { img, crop } = cropState;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  if (!crop) return;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.fillRect(0, 0, canvas.width, crop.y);
+  ctx.fillRect(0, crop.y + crop.h, canvas.width, canvas.height - crop.y - crop.h);
+  ctx.fillRect(0, crop.y, crop.x, crop.h);
+  ctx.fillRect(crop.x + crop.w, crop.y, canvas.width - crop.x - crop.w, crop.h);
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(crop.x + 1, crop.y + 1, crop.w - 2, crop.h - 2);
+}
+
+function canvasPoint(event) {
+  const canvas = element('cover-canvas');
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(canvas.width, (event.clientX - rect.left) * canvas.width / rect.width)),
+    y: Math.max(0, Math.min(canvas.height, (event.clientY - rect.top) * canvas.height / rect.height))
+  };
+}
+
+function setupCropCanvas() {
+  const canvas = element('cover-canvas');
+  canvas.addEventListener('pointerdown', event => {
+    if (!cropState || busy) return;
+    const p = canvasPoint(event);
+    const c = cropState.crop;
+    const inside = c && p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h;
+    cropState.drag = inside ? { move: true, dx: p.x - c.x, dy: p.y - c.y } : { move: false, ox: p.x, oy: p.y };
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointermove', event => {
+    if (!cropState?.drag) return;
+    const p = canvasPoint(event);
+    const d = cropState.drag;
+    if (d.move) {
+      const c = cropState.crop;
+      c.x = Math.max(0, Math.min(canvas.width - c.w, p.x - d.dx));
+      c.y = Math.max(0, Math.min(canvas.height - c.h, p.y - d.dy));
+    } else {
+      const sx = p.x >= d.ox ? 1 : -1;
+      const sy = p.y >= d.oy ? 1 : -1;
+      const maxW = sx > 0 ? canvas.width - d.ox : d.ox;
+      const maxH = sy > 0 ? canvas.height - d.oy : d.oy;
+      let w = Math.min(Math.max(Math.abs(p.x - d.ox), Math.abs(p.y - d.oy) / 1.5), maxW, maxH / 1.5);
+      if (w < 10) return;
+      const h = w * 1.5;
+      cropState.crop = { x: sx > 0 ? d.ox : d.ox - w, y: sy > 0 ? d.oy : d.oy - h, w, h };
+    }
+    drawCrop();
+  });
+  const end = () => { if (cropState) cropState.drag = null; };
+  canvas.addEventListener('pointerup', end);
+  canvas.addEventListener('pointercancel', end);
+}
+
+// Crop rectangle in original image pixels, or null for the whole image.
+function cropRegion() {
+  if (!cropState?.crop) return null;
+  const { crop, scale, img } = cropState;
+  const x = Math.round(crop.x / scale);
+  const y = Math.round(crop.y / scale);
+  return { x, y, width: Math.min(img.width - x, Math.round(crop.w / scale)), height: Math.min(img.height - y, Math.round(crop.h / scale)) };
 }
 
 function resetCrop() {
   if (!cropState) return;
-  const canvas = element('cover-canvas');
-  const ctx = canvas.getContext('2d');
-  const { img, x, y, w, h } = cropState;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(img, x, y, w, h);
-  cropState.cropX = 0;
-  cropState.cropY = 0;
-  cropState.cropW = w;
-  cropState.cropH = h;
+  cropState.crop = defaultCrop();
+  drawCrop();
+}
+
+function useWholeImage() {
+  if (!cropState) return;
+  cropState.crop = null;
+  drawCrop();
 }

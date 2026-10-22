@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import sys
 import threading
 from pathlib import Path
@@ -97,6 +98,21 @@ class Bridge:
             )
             self.thread = threading.Thread(target=self.run, args=(context, source, output))
             self.thread.start()
+        elif kind == "fix_epub":
+            if self.thread and self.thread.is_alive():
+                raise ValueError("A run is already active.")
+            source = Path(message["input"])
+            output = Path(message["output"])
+            if not source.is_file() or source.suffix.lower() != ".epub":
+                raise ValueError(f"Source must be an existing EPUB file: {source}")
+            if output.suffix.lower() != ".epub" or not output.parent.is_dir():
+                raise ValueError("Choose an EPUB destination in an existing folder.")
+            if output.resolve() == source.resolve():
+                raise ValueError("Destination must differ from the source EPUB.")
+            cover_options = message.get("cover") or {"mode": "auto", "textColor": "#ffffff", "bgColor": "#0f131c"}
+            self.cancel.clear()
+            self.thread = threading.Thread(target=self.run_fix, args=(source, output, cover_options))
+            self.thread.start()
         elif kind == "pause":
             self.pause.clear()
         elif kind == "resume":
@@ -123,6 +139,26 @@ class Bridge:
             self.emit("error", str(error))
         finally:
             logger.removeHandler(handler)
+            self.events.put(None)
+
+    def run_fix(self, source, output, cover_options):
+        try:
+            from novel_translator.epub_builder import extract_epub_text, make_epub, read_epub_title
+            self.emit("log", f"Reading {source.name}")
+            self.emit("progress", 0.2)
+            text = extract_epub_text(source)
+            # The name chosen in the app wins over the old EPUB metadata, matching translate mode.
+            title = re.sub(r"\s+fixed$", "", output.stem, flags=re.IGNORECASE).strip()
+            title = title or read_epub_title(source) or source.stem
+            self.emit("log", f"Rebuilding chapters and cover for \"{title}\"")
+            self.emit("progress", 0.6)
+            make_epub(text, output, title, cover_options)
+            self.emit("progress", 1.0)
+            self.emit("log", f"Saved {output}")
+            self.emit("done", str(output))
+        except Exception as error:
+            self.emit("error", str(error))
+        finally:
             self.events.put(None)
 
     def forward(self):

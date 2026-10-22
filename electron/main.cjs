@@ -78,6 +78,14 @@ ipcMain.handle('pick', async (_, kind) => {
     }
     return selected.canceled ? null : selected.filePaths[0];
   }
+  if (kind === 'epub') {
+    const selected = await dialog.showOpenDialog(window, { defaultPath: folders.epub || folders.output, properties: ['openFile'], filters: [{ name: 'EPUB book', extensions: ['epub'] }] });
+    if (!selected.canceled) {
+      rememberFolder('epub', selected.filePaths[0]);
+      allowedPaths.input = selected.filePaths[0];
+    }
+    return selected.canceled ? null : selected.filePaths[0];
+  }
   if (kind === 'image') {
     const selected = await dialog.showOpenDialog(window, { defaultPath: folders.cover, properties: ['openFile'], filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }] });
     if (!selected.canceled) {
@@ -106,19 +114,29 @@ ipcMain.handle('default-output', () => {
   return folder;
 });
 ipcMain.handle('drop-input', (_, filePath) => {
-  if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || path.extname(filePath).toLowerCase() !== '.txt') throw new Error('Only .txt files can be dropped');
+  const ext = typeof filePath === 'string' ? path.extname(filePath).toLowerCase() : '';
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !['.txt', '.epub'].includes(ext)) throw new Error('Only .txt or .epub files can be dropped');
   if (!fs.statSync(filePath, { throwIfNoEntry: false })?.isFile()) throw new Error('Dropped file is not accessible');
-  rememberFolder('input', filePath);
+  rememberFolder(ext === '.epub' ? 'epub' : 'input', filePath);
   allowedPaths.input = filePath;
   return filePath;
 });
+ipcMain.handle('cover-preview', () => {
+  const file = allowedPaths.cover;
+  if (!file || !fs.statSync(file, { throwIfNoEntry: false })?.isFile()) throw new Error('No cover image selected');
+  const ext = path.extname(file).toLowerCase();
+  const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+  return `data:${mime};base64,${fs.readFileSync(file).toString('base64')}`;
+});
 ipcMain.handle('command', (_, message) => {
   if (!worker || !worker.stdin.writable) throw new Error('Python backend is unavailable. Restart after installing dependencies.');
-  if (!message || !['start', 'pause', 'resume', 'cancel', 'decision', 'settings', 'checkpoint_status'].includes(message.kind)) throw new Error('Invalid command');
-  if (message.kind === 'start') {
+  if (!message || !['start', 'fix_epub', 'pause', 'resume', 'cancel', 'decision', 'settings', 'checkpoint_status'].includes(message.kind)) throw new Error('Invalid command');
+  if (message.kind === 'start' || message.kind === 'fix_epub') {
     if (busy) throw new Error('A run is already active');
     if (message.input !== allowedPaths.input) throw new Error('Source path does not match the file picker selection');
     if (typeof message.output !== 'string' || !allowedPaths.output || path.dirname(message.output) !== allowedPaths.output || path.extname(message.output).toLowerCase() !== '.epub') throw new Error('Destination must be an .epub file in the selected folder');
+    if (path.resolve(message.output).toLowerCase() === path.resolve(message.input).toLowerCase()) throw new Error('Destination must differ from the source file');
+    if (message.cover?.mode === 'import' && message.cover.imagePath !== allowedPaths.cover) throw new Error('Cover image does not match the file picker selection');
     busy = true;
     result = null;
   }
