@@ -81,6 +81,30 @@ class EncodingTests(unittest.TestCase):
         self.assertEqual(actual, text)
         self.assertTrue(any('mojibake' in warning for warning in meta['warnings']))
 
+    def test_bomless_chinese_utf16_is_detected(self):
+        text = '第一章 他走进了房间，看着窗外的雨。\n' * 50
+        for encoding in ('utf-16-le', 'utf-16-be'):
+            with self.subTest(encoding=encoding):
+                actual, meta = self.decode(text.encode(encoding))
+                self.assertEqual((actual, meta['encoding']), (text, encoding))
+
+    def test_text_starting_with_mz_is_not_binary(self):
+        actual, _ = self.decode(b'MZ is the start of this English line.')
+        self.assertTrue(actual.startswith('MZ'))
+
+    def test_single_weak_mojibake_character_is_not_warned(self):
+        _, meta = self.decode('Jürgen Österreich ¼ cup'.encode())
+        self.assertFalse(any('mojibake' in warning for warning in meta['warnings']))
+
+    def test_legacy_chinese_autodetection_prefers_real_text(self):
+        simplified = '他说你好吗？我们还没有到那里去，这个时候还是要回来的。\n' * 3
+        traditional = '他說你好嗎？我們還沒有到那裡去，這個時候還是要回來的。\n' * 3
+        for text, encoding in ((simplified, 'gb18030'), (traditional, 'big5')):
+            with self.subTest(encoding=encoding):
+                actual, meta = self.decode(text.encode(encoding))
+                self.assertEqual(actual, text)
+                self.assertEqual(meta['encoding'], encoding)
+
     def test_manual_selection_rereads_original(self):
         self.source.write_bytes('中文文本'.encode('gbk'))
         first = decode_source(self.source, 'gbk')
