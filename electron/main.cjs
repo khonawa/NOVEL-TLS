@@ -3,12 +3,51 @@ const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const readline = require('node:readline');
+const { setTimeout, clearTimeout } = require('node:timers');
 let window;
 let worker;
 let busy = false;
 let result;
 let folders = {};
 let allowedPaths = {};
+const encodings = new Set(['auto', 'utf-8', 'utf-16-le', 'utf-16-be', 'utf-32-le', 'utf-32-be', 'gb2312', 'gbk', 'gb18030', 'big5', 'big5hkscs']);
+let previewSequence = 0;
+let pendingPreview;
+let validatedPreview;
+let titleSequence = 0;
+let pendingTitle;
+function cancelTitle(reason = 'Title suggestion cancelled.') {
+  if (!pendingTitle) return;
+  pendingTitle.cancelReason = reason;
+  if (worker?.stdin.writable) worker.stdin.write(JSON.stringify({ kind: 'cancel_title' }) + '\n');
+  // Retain the lock until Python confirms subprocess/browser cleanup.
+}
+function finishTitle(error, value) {
+  if (!pendingTitle) return;
+  clearTimeout(pendingTitle.timer);
+  if (error || pendingTitle.cancelReason) pendingTitle.reject(new Error(pendingTitle.cancelReason || error));
+  else pendingTitle.resolve(value);
+  pendingTitle = null;
+}
+function invalidatePreview(reason = 'Preview superseded. Preview and confirm the source again.') {
+  validatedPreview = null;
+  if (pendingPreview) {
+    clearTimeout(pendingPreview.timer);
+    pendingPreview.reject(new Error(reason));
+    pendingPreview = null;
+  }
+  if (worker?.stdin.writable) worker.stdin.write(JSON.stringify({ kind: 'cancel_preview' }) + '\n');
+}
+function selectInput(file) {
+  cancelTitle('Source selection changed.');
+  invalidatePreview();
+  allowedPaths.input = file;
+}
+function requirePreview(message) {
+  if (!validatedPreview || validatedPreview.input !== message.input || validatedPreview.encoding !== message.encoding || validatedPreview.digest !== message.digest) {
+    throw new Error('Preview and confirm the selected text encoding first.');
+  }
+}
 function rememberFolder(kind, selected) {
   folders[kind] = path.dirname(selected);
   try {
@@ -24,10 +63,30 @@ function startWorker() {
   const local = path.join(__dirname, '../.venv/Scripts/python.exe');
   const parent = path.join(__dirname, '../../.venv/Scripts/python.exe');
   const python = process.env.NOVELTL_PYTHON || (fs.existsSync(local) ? local : fs.existsSync(parent) ? parent : 'python');
-  worker = spawn(python, ['-u', path.join(backend, 'bridge.py')], { cwd: backend, windowsHide: true });
-  readline.createInterface({ input: worker.stdout }).on('line', line => {
+  const child = spawn(python, ['-u', path.join(backend, 'bridge.py')], { cwd: backend, windowsHide: true });
+  worker = child;
+  readline.createInterface({ input: child.stdout }).on('line', line => {
+    if (worker !== child) return;
     try {
       const event = JSON.parse(line);
+      if (event.kind === 'title_result') {
+        if (pendingTitle?.id !== event.value.requestId) return;
+        finishTitle(event.value.error, event.value.title);
+        send('title_idle', null);
+        return;
+      }
+      if (event.kind === 'preview_result') {
+        const pending = pendingPreview;
+        if (!pending || pending.id !== event.value.requestId) return;
+        clearTimeout(pending.timer);
+        pendingPreview = null;
+        if (event.value.error) pending.reject(new Error(event.value.error));
+        else {
+          validatedPreview = { ...event.value, input: pending.input };
+          pending.resolve(event.value);
+        }
+        return;
+      }
       if (event.kind === 'idle' || event.kind === 'command_error') busy = false;
       if (event.kind === 'done') {
         result = String(event.value);
@@ -47,10 +106,18 @@ function startWorker() {
       send(event.kind, event.value);
     } catch { send('log', line); }
   });
-  readline.createInterface({ input: worker.stderr }).on('line', line => send('log', line));
-  worker.stdin.on('error', error => send('error', error.message));
-  worker.on('error', error => send('error', `Python could not start: ${error.message}`));
-  worker.on('close', code => { worker = null; busy = false; send('offline', `Backend exited (${code}). Check Python dependencies.`); });
+  readline.createInterface({ input: child.stderr }).on('line', line => { if (worker === child) send('log', line); });
+  const failed = message => {
+    if (worker !== child) return;
+    worker = null;
+    finishTitle(message);
+    invalidatePreview(message);
+    busy = false;
+    send('offline', message);
+  };
+  child.stdin.on('error', error => failed(error.message));
+  child.on('error', error => failed(`Python could not start: ${error.message}`));
+  child.on('close', code => failed(`Backend exited (${code}). Check Python dependencies.`));
 }
 
 app.whenReady().then(() => {
@@ -61,7 +128,7 @@ app.whenReady().then(() => {
   window.loadFile(path.join(__dirname, '../src/index.html'));
   window.webContents.once('did-finish-load', startWorker);
   window.on('close', event => {
-    if (busy) {
+    if (busy || pendingTitle) {
       const answer = dialog.showMessageBoxSync(window, { type: 'question', message: 'Cancel the active translation and close?', buttons: ['Keep translating', 'Cancel and close'], defaultId: 0, cancelId: 0 });
       if (answer === 0) { event.preventDefault(); return; }
     }
@@ -74,7 +141,7 @@ ipcMain.handle('pick', async (_, kind) => {
     const selected = await dialog.showOpenDialog(window, { defaultPath: folders.input, properties: ['openFile'], filters: [{ name: 'Novel text', extensions: ['txt'] }] });
     if (!selected.canceled) {
       rememberFolder('input', selected.filePaths[0]);
-      allowedPaths.input = selected.filePaths[0];
+      selectInput(selected.filePaths[0]);
     }
     return selected.canceled ? null : selected.filePaths[0];
   }
@@ -82,7 +149,7 @@ ipcMain.handle('pick', async (_, kind) => {
     const selected = await dialog.showOpenDialog(window, { defaultPath: folders.epub || folders.output, properties: ['openFile'], filters: [{ name: 'EPUB book', extensions: ['epub'] }] });
     if (!selected.canceled) {
       rememberFolder('epub', selected.filePaths[0]);
-      allowedPaths.input = selected.filePaths[0];
+      selectInput(selected.filePaths[0]);
     }
     return selected.canceled ? null : selected.filePaths[0];
   }
@@ -118,7 +185,7 @@ ipcMain.handle('drop-input', (_, filePath) => {
   if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !['.txt', '.epub'].includes(ext)) throw new Error('Only .txt or .epub files can be dropped');
   if (!fs.statSync(filePath, { throwIfNoEntry: false })?.isFile()) throw new Error('Dropped file is not accessible');
   rememberFolder(ext === '.epub' ? 'epub' : 'input', filePath);
-  allowedPaths.input = filePath;
+  selectInput(filePath);
   return filePath;
 });
 ipcMain.handle('cover-preview', () => {
@@ -128,17 +195,49 @@ ipcMain.handle('cover-preview', () => {
   const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
   return `data:${mime};base64,${fs.readFileSync(file).toString('base64')}`;
 });
+ipcMain.handle('cancel-title', () => cancelTitle());
+ipcMain.handle('suggest-title', () => {
+  if (busy || pendingTitle) throw new Error('Wait for the active browser operation to finish.');
+  if (!worker?.stdin.writable) throw new Error('Python backend is unavailable.');
+  const input = allowedPaths.input;
+  if (!input || path.extname(input).toLowerCase() !== '.txt') throw new Error('Select a TXT file first.');
+  const id = ++titleSequence;
+  return new Promise((resolve, reject) => {
+    // Python owns the 90s operation budget plus up to 20s process-tree cleanup.
+    const timer = setTimeout(() => cancelTitle('Title suggestion timed out; waiting for browser cleanup.'), 115000);
+    pendingTitle = { id, resolve, reject, timer };
+    worker.stdin.write(JSON.stringify({ kind: 'suggest_title', input, requestId: id }) + '\n');
+  });
+});
+ipcMain.handle('cancel-text-preview', () => invalidatePreview());
+ipcMain.handle('text-preview', (_, encoding) => {
+  if (busy) throw new Error('Wait for the active run to finish.');
+  if (!encodings.has(encoding)) throw new Error('Unsupported encoding');
+  if (!worker?.stdin.writable) throw new Error('Python backend is unavailable. Restart it and select the source again.');
+  const input = allowedPaths.input;
+  if (!input || path.extname(input).toLowerCase() !== '.txt') throw new Error('Select a TXT file first.');
+  invalidatePreview();
+  const id = ++previewSequence;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => invalidatePreview('Preview timed out. Retry or select a smaller source.'), 120000);
+    pendingPreview = { id, input, resolve, reject, timer };
+    worker.stdin.write(JSON.stringify({ kind: 'preview', requestId: id, input, encoding }) + '\n');
+  });
+});
 ipcMain.handle('command', (_, message) => {
   if (!worker || !worker.stdin.writable) throw new Error('Python backend is unavailable. Restart after installing dependencies.');
   if (!message || !['start', 'fix_epub', 'pause', 'resume', 'cancel', 'decision', 'settings', 'checkpoint_status'].includes(message.kind)) throw new Error('Invalid command');
-  if (message.kind === 'start' || message.kind === 'fix_epub') {
-    if (busy) throw new Error('A run is already active');
+  if (message.kind === 'start' || message.kind === 'checkpoint_status') requirePreview(message);
+  if (message.kind === 'start' || message.kind === 'fix_epub' || message.kind === 'checkpoint_status') {
+    if (busy || pendingTitle) throw new Error('A browser operation is already active');
     if (message.input !== allowedPaths.input) throw new Error('Source path does not match the file picker selection');
     if (typeof message.output !== 'string' || !allowedPaths.output || path.dirname(message.output) !== allowedPaths.output || path.extname(message.output).toLowerCase() !== '.epub') throw new Error('Destination must be an .epub file in the selected folder');
     if (path.resolve(message.output).toLowerCase() === path.resolve(message.input).toLowerCase()) throw new Error('Destination must differ from the source file');
     if (message.cover?.mode === 'import' && message.cover.imagePath !== allowedPaths.cover) throw new Error('Cover image does not match the file picker selection');
-    busy = true;
-    result = null;
+    if (message.kind !== 'checkpoint_status') {
+      busy = true;
+      result = null;
+    }
   }
   worker.stdin.write(JSON.stringify(message) + '\n');
 });
@@ -148,6 +247,8 @@ ipcMain.handle('open-result', async (_, folder) => {
   else { const error = await shell.openPath(result); if (error) throw new Error(error); }
 });
 ipcMain.handle('restart-backend', () => {
+  if (busy || pendingTitle) throw new Error('Cancel the active operation and wait for cleanup before restarting.');
+  invalidatePreview('Backend restarted. Select and preview the source again.');
   if (worker) {
     worker.stdin.end();
     worker = null;

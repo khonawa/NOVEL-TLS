@@ -23,30 +23,18 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(validate_translated_chunk(source, "", 50)[0])
         self.assertFalse(validate_translated_chunk(source, "tiny", 50)[0])
 
-    def test_targeted_cleanup_stalls_and_retries_once(self):
-        states = []
+    def test_targeted_cleanup_uses_bounded_watchdog(self):
+        from test_watchdog import FakeClock, FakePage
+
+        clock = FakeClock()
+        page = FakePage(clock, lambda: "English text " + "\u4e2d" * 20)
         retries = []
-
-        class Page:
-            def locator(self, selector):
-                return self
-
-            def inner_text(self, **kwargs):
-                return "English text " + "\u4e2d" * 20
-
-            def evaluate(self, script, argument=None):
-                if argument is None:
-                    self_test.assertNotIn("scrollTo", script)
-                    return True
-                states.append(argument["cleanup"])
-                return {"bottom": True, "targeted": False}
-
-        self_test = self
-        with patch("novel_translator.chrome.time.monotonic", side_effect=range(0, 1000, 10)), patch("novel_translator.chrome.time.sleep"):
-            result = wait_for_translation(Page(), 100, threading.Event(), lambda message: None, lambda: retries.append(True), lambda: 0.1, lambda: 10)
-        self.assertEqual(states, [False] + [True] * 6)
+        with patch("novel_translator.chrome.time.monotonic", clock.now), patch("novel_translator.chrome.time.sleep", clock.sleep):
+            with self.assertRaisesRegex(TimeoutError, "recovery exhausted"):
+                wait_for_translation(page, 100, threading.Event(), lambda message: None, lambda: retries.append(True), lambda: 0.1, lambda: 10)
         self.assertEqual(len(retries), 1)
-        self.assertEqual(chinese_count(result), 20)
+        self.assertEqual(len(page.reloads), 1)
+        self.assertTrue(any(cleanup for _, cleanup in page.scrolls))
 
     def test_extended_chinese_count(self):
         self.assertEqual(chinese_count("English \u4e2d\u3007\uf900\U00020000\U00030000"), 5)

@@ -61,6 +61,10 @@ REQUIRED_SWEEPS_MAX = 10
 # scroll), don't scroll faster than this floor so Chrome has time to translate.
 TARGETED_SCROLL_MIN_INTERVAL = 0.15
 
+# A stalled targeted cleanup at or below this share of the original Chinese
+# characters is sent to the validation dialog instead of being reloaded.
+CLEANUP_REVIEW_MAX_RATIO = 0.05
+
 # Debounce window (milliseconds) for persisting settings after a control is
 # touched, so a crash mid-edit still saves but we don't rewrite the file on
 # every slider tick (#20).
@@ -79,14 +83,15 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def sanitize_filename(name: str) -> str:
-    """Return ``name`` with Windows-illegal characters stripped and trailing
-    dots/spaces removed, so it can be used as a file or directory name."""
-    cleaned = INVALID_FILENAME_CHARS_RE.sub("", name).strip().rstrip(". ").strip()
+    """Return a Windows-safe stem, bounded to 180 UTF-16 code units."""
+    cleaned = INVALID_FILENAME_CHARS_RE.sub("_", name).strip().rstrip(". ")
+    cleaned = cleaned.encode("utf-16-le", errors="surrogatepass")[:360].decode("utf-16-le", errors="ignore").rstrip(". ")
     if not cleaned:
         cleaned = "untitled"
-    if cleaned.lower() in WINDOWS_RESERVED_NAMES:
+    base = cleaned.split(".")[0].rstrip(" ").lower()
+    if base in WINDOWS_RESERVED_NAMES or re.fullmatch(r"(?:com|lpt)[¹²³]", base):
         cleaned = f"_{cleaned}"
-    return cleaned
+    return cleaned.encode("utf-16-le")[:360].decode("utf-16-le", errors="ignore").rstrip(". ")
 
 
 CHINESE_RE = re.compile(r"[\u3007\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ee5f\U0002f800-\U0002fa1f\U00030000-\U0003347f]")

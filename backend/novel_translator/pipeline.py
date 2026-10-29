@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
@@ -32,6 +32,7 @@ from .checkpoint import (
     save_checkpoint_chunk,
 )
 from .chrome import (
+    _ActiveClock,
     automate_chrome_translation,
     seed_chrome_profile,
     wait_for_auto_translation,
@@ -103,13 +104,14 @@ class InMemoryChunkHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def make_chunk_server() -> "tuple[HTTPServer, dict[str, bytes], int]":
+def make_chunk_server() -> "tuple[ThreadingHTTPServer, dict[str, bytes], int]":
     """Create a loopback HTTP server whose ``chunks`` dict is served from memory.
 
     Returns ``(server, chunks_map, port)``. The caller fills ``chunks_map`` with
     ``{filename: html_bytes}`` and navigates Chrome to the matching URL.
     """
-    server = HTTPServer(("127.0.0.1", 0), InMemoryChunkHandler)
+    # Chrome preconnects can leave sockets idle; they must not block GETs or shutdown.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), InMemoryChunkHandler)
     chunks: dict[str, bytes] = {}
     server.chunks = chunks  # type: ignore[attr-defined]
     return server, chunks, server.server_address[1]
@@ -148,6 +150,8 @@ class PipelineContext:
     pause_event: threading.Event
     get_scroll_interval: Callable[[], float]
     get_required_sweeps: Callable[[], int]
+    source_encoding: str = field(default="auto", kw_only=True)
+    source_digest: str | None = field(default=None, kw_only=True)
     remaining_chinese_limit: int = field(default=0, kw_only=True)
     request_validation: Callable[[int, str], str]
     chunk_limit: int = field(default_factory=lambda: CHUNK_PRESETS["Balanced (275k)"])
@@ -183,8 +187,10 @@ class TranslationRunner:
             if safe_output != output_path:
                 log.info("Sanitized output filename to %s", safe_output.name)
                 output_path = safe_output
+            if output_path.exists():
+                raise FileExistsError(f"EPUB already exists; choose another name: {output_path}")
             log.info("Reading %s", input_path.name)
-            source_text = read_text_file(input_path)
+            source_text = read_text_file(input_path, self.ctx.source_encoding, self.ctx.source_digest)
             chunk_limit = self.ctx.chunk_limit
             chunks = split_text(source_text, chunk_limit)
             if not chunks:
@@ -245,8 +251,10 @@ class TranslationRunner:
                     result = ""
                     chunk_started = time.monotonic()
                     last_error: Exception | None = None
+                    attempt_clock = _ActiveClock(self.ctx.pause_event, self.ctx.cancel_event)
                     for attempt in range(1, CHUNK_MAX_ATTEMPTS + 1):
                         try:
+                            attempt_clock.now()
                             log.info(
                                 "Translating chunk %d/%d (attempt %d/%d)...",
                                 index, len(chunks), attempt, CHUNK_MAX_ATTEMPTS,
@@ -285,6 +293,8 @@ class TranslationRunner:
                             chrome_pid = getattr(page, "_novel_chrome_pid", None)
 
                             def retry_translation() -> bool:
+                                if self.ctx.cancel_event.is_set():
+                                    raise InterruptedError("Translation cancelled.")
                                 return automate_chrome_translation(page, self._report, chrome_pid)
 
                             original_count = chinese_count(chunk)
@@ -309,6 +319,7 @@ class TranslationRunner:
                                 ),
                                 remaining_chinese_limit=self.ctx.remaining_chinese_limit,
                             )
+                            attempt_clock.now()
                             valid, reason = validate_translated_chunk(
                                 chunk, candidate, self.ctx.remaining_chinese_limit
                             )
@@ -332,10 +343,10 @@ class TranslationRunner:
                             last_error = exc
                             log.warning("Chunk %d attempt %d failed: %s", index, attempt, exc)
                             if attempt < CHUNK_MAX_ATTEMPTS:
-                                log.info("Restarting Chrome and retrying this chunk...")
-                        finally:
-                            if attempt < CHUNK_MAX_ATTEMPTS and not result:
-                                time.sleep(CHUNK_ATTEMPT_BACKOFF_S)
+                                log.info("Retrying the current chunk with a fresh navigation...")
+                                retry_at = attempt_clock.now() + CHUNK_ATTEMPT_BACKOFF_S
+                                while attempt_clock.now() < retry_at:
+                                    time.sleep(0.1)
                     if not result:
                         statuses[index - 1] = "Failed"
                         self._emit("chunk_statuses", statuses.copy())
@@ -346,6 +357,7 @@ class TranslationRunner:
                         self._emit("run_info", (len(completed), len(chunks), statuses.count("Failed")))
                         self._emit("stats", (0, 0.0, index, 0.0, True))
                         continue
+                    attempt_clock.now()
                     save_checkpoint_chunk(progress_dir, index, result)
                     completed[index] = result
                     statuses[index - 1] = "Complete"

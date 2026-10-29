@@ -9,8 +9,17 @@
     <section class="configuration"><h2>Source & destination</h2>
       <div class="mode-selector"><label><input type="radio" name="mode" value="translate" checked>Translate text file</label><label><input type="radio" name="mode" value="fix">Fix EPUB file</label></div>
       <label for="input" id="input-label">Source novel</label><div class="file"><input id="input" readonly placeholder="No file selected"><button id="pick-input">Browse</button></div>
+      <div class="translate-only encoding-panel">
+        <label for="encoding">Source encoding</label>
+        <select id="encoding"><option value="auto">Auto (detect)</option><option value="utf-8">UTF-8</option><option value="utf-16-le">UTF-16 LE</option><option value="utf-16-be">UTF-16 BE</option><option value="utf-32-le">UTF-32 LE</option><option value="utf-32-be">UTF-32 BE</option><option value="gb2312">GB2312</option><option value="gbk">GBK</option><option value="gb18030">GB18030</option><option value="big5">Big5</option><option value="big5hkscs">Big5-HKSCS</option></select>
+        <button id="refresh-preview" type="button">Refresh preview</button>
+        <p id="encoding-status" role="status">Select a TXT file to preview.</p>
+        <pre id="text-preview" aria-label="Decoded source preview" tabindex="0"></pre>
+        <label class="toggle"><input id="confirm-encoding" type="checkbox" disabled>I reviewed this preview and confirm the encoding.</label>
+      </div>
       <label for="name">Translation name</label><input id="name" type="text" placeholder="Translation name" maxlength="180">
       <label class="toggle"><input id="original-name" type="checkbox" checked>Original name + EN</label>
+      <div class="translate-only"><button id="suggest-title" type="button">Translate filename to English</button><button id="cancel-title" type="button" disabled>Cancel suggestion</button><p>Optional: sends the filename stem to Chrome’s translation service (not offline). Review or edit the suggestion above before starting.</p><p id="title-status" role="status"></p></div>
       <label for="output">EPUB destination</label><div class="file"><input id="output" readonly placeholder="No destination selected"><button id="pick-output">Choose folder</button></div>
       <div class="translate-only"><label for="preset">Chunk size</label><select id="preset"><option value="60000">Ultra Safe · 60,000 characters</option><option value="125000">Reliable · 125,000 characters</option><option value="275000" selected>Balanced · 275,000 characters</option><option value="450000">Fast · 450,000 characters</option><option value="custom">Custom</option></select>
       <div id="custom-chunk-wrapper" style="display: none;"><label for="custom-chunk">Custom chunk size</label><input id="custom-chunk" type="number" min="1000" max="1000000" step="1000" placeholder="Enter characters (e.g. 80000)"></div></div>

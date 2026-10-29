@@ -8,31 +8,9 @@ from pathlib import Path
 from .constants import CHINESE_RE, DEFAULT_CHUNK_LIMIT
 
 
-def read_text_file(path: Path) -> str:
-    raw = path.read_bytes()
-    # UTF-8 variants first: strict, so a genuinely UTF-8 file never falls through.
-    for encoding in ("utf-8-sig", "utf-8"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    # Legacy CJK codecs will happily "decode" almost any byte sequence into
-    # mojibake, so only accept the result when it actually looks like Chinese.
-    for encoding in ("gb18030", "big5"):
-        try:
-            text = raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-        if "\ufffd" in text:
-            continue
-        # Confidence check: expect a meaningful share of CJK characters and no
-        # large runs of rare/symbol codepoints that indicate a wrong codec.
-        sample = text[:20000]
-        cjk = len(CHINESE_RE.findall(sample))
-        suspicious = sum(1 for ch in sample if "\u0080" <= ch <= "\u04ff")
-        if len(sample) < 100 or cjk / len(sample) > 0.05 or suspicious < len(sample) * 0.01:
-            return text
-    raise ValueError("Could not decode the file as UTF-8, GB18030, or Big5.")
+def read_text_file(path: Path, encoding: str = "auto", expected_digest: str | None = None) -> str:
+    from .encoding import decode_source
+    return decode_source(path, encoding, expected_digest)[0]
 
 
 def split_text(text: str, limit: int = DEFAULT_CHUNK_LIMIT) -> list[str]:

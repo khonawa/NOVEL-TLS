@@ -10,11 +10,31 @@ from typing import Callable
 from playwright.sync_api import Page
 
 from .constants import (
+    CHROME_GOTO_TIMEOUT_MS,
+    CHROME_ERROR_MARKERS,
+    CLEANUP_REVIEW_MAX_RATIO,
     TARGETED_SCROLL_MIN_INTERVAL,
-    TRANSLATE_RETRY_DELAYS_S,
-    TRANSLATION_SWEEP_TARGET_RATIO,
 )
 from .text_processing import chinese_count
+from .translation import TranslationWatchdog
+
+
+class _ActiveClock:
+    def __init__(self, pause_event: threading.Event | None, cancel: threading.Event) -> None:
+        self.pause_event = pause_event
+        self.cancel = cancel
+        self.paused_seconds = 0.0
+
+    def now(self) -> float:
+        if self.cancel.is_set():
+            raise InterruptedError("Translation cancelled.")
+        if self.pause_event is not None and not self.pause_event.is_set():
+            started = time.monotonic()
+            _pace(self.pause_event, self.cancel)
+            self.paused_seconds += time.monotonic() - started
+        if self.cancel.is_set():
+            raise InterruptedError("Translation cancelled.")
+        return time.monotonic() - self.paused_seconds
 
 
 def _get_desktop_class():
@@ -59,6 +79,8 @@ def automate_chrome_translation(
     page: Page,
     report: Callable[[str], None],
     pid: "int | None" = None,
+    *,
+    ensure_english: bool = False,
 ) -> bool:
     """Invoke Chrome's native page-translation menu through Windows UI Automation."""
     Desktop = _get_desktop_class()
@@ -77,6 +99,8 @@ def automate_chrome_translation(
                 chrome = desktop.window(process=pid, title_re=rf".*{re.escape(page_title)}.*")
                 chrome.wait("visible", timeout=3)
             except Exception:
+                if ensure_english:
+                    raise
                 chrome = desktop.window(title_re=rf".*{re.escape(page_title)}.*Chrome.*")
                 chrome.wait("visible", timeout=10)
         else:
@@ -87,7 +111,7 @@ def automate_chrome_translation(
         try_again = chrome.child_window(
             title_re=r"(?i)^Try again$", control_type="Button"
         )
-        if try_again.exists(timeout=1):
+        if not ensure_english and try_again.exists(timeout=1):
             try_again.wait("visible enabled", timeout=3)
             try:
                 try_again.invoke()
@@ -95,11 +119,9 @@ def automate_chrome_translation(
                 try_again.click_input()
             report("Chrome translation failed; pywinauto clicked Try again.")
             return True
-        bounds = chrome.rectangle()
-        chrome.click_input(
-            coords=(bounds.left + max(100, bounds.width() // 2), bounds.top + max(150, bounds.height() // 2)),
-            button="right",
-        )
+        # Use content coordinates, not screen coordinates interpreted as window-relative.
+        viewport = page.viewport_size or page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+        page.mouse.click(viewport["width"] // 2, viewport["height"] // 2, button="right")
         menu = Desktop(backend="uia").window(class_name="#32768")
         menu.wait("visible", timeout=5)
         translation_item = menu.child_window(title_re=r"(?i).*translate.*", control_type="MenuItem")
@@ -152,17 +174,15 @@ def wait_for_auto_translation(
     pause_event: threading.Event | None = None,
 ) -> bool:
     """Give Chrome's profile-driven translation a chance before using UI automation."""
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if cancel.is_set():
-            raise InterruptedError("Translation cancelled.")
-        _pace(pause_event, cancel)
+    clock = _ActiveClock(pause_event, cancel)
+    deadline = clock.now() + timeout_seconds
+    while clock.now() < deadline:
         translated_dom = page.evaluate(
             """() => document.documentElement.classList.contains('translated-ltr') ||
                 document.documentElement.classList.contains('translated-rtl')"""
         )
         text = page.locator("body").inner_text(timeout=5_000).strip()
-        count_dropped = original_count > 0 and chinese_count(text) < int(original_count * 0.99)
+        count_dropped = bool(text) and original_count > 0 and chinese_count(text) < original_count * 0.99
         if translated_dom or count_dropped:
             return True
         page.wait_for_timeout(250)
@@ -181,32 +201,38 @@ def wait_for_translation(
     report_progress: Callable[[float], None] | None = None,
     remaining_chinese_limit: int = 0,
 ) -> str:
-    started = time.monotonic()
+    clock = _ActiveClock(pause_event, cancel)
+    started = clock.now()
+    watchdog = TranslationWatchdog(original_count, started)
     next_report = started + 5
     next_stats = started
     next_scroll = started
-    retry_delays = iter(TRANSLATE_RETRY_DELAYS_S)
-    next_retry = started + next(retry_delays)
     translation_started = False
     pass_number = 1
     cleanup = False
-    best_remaining = original_count
-    stalled_rounds = 0
-    cleanup_retried = False
 
     while True:
         if cancel.is_set():
             raise InterruptedError("Translation cancelled.")
-        _pace(pause_event, cancel)
-        text = page.locator("body").inner_text(timeout=5_000).strip()
+        clock.now()
+        try:
+            text = page.locator("body").inner_text(timeout=5_000).strip()
+        except Exception as exc:
+            report(f"Chrome body read failed ({type(exc).__name__}): {exc}")
+            raise
         remaining = chinese_count(text)
+        error_marker = next((marker for marker in CHROME_ERROR_MARKERS if marker in text.lower()), None)
+        if error_marker:
+            report(f"Chrome error-page evidence: {error_marker}")
+            raise RuntimeError(f"Chrome returned an error page: {error_marker}")
         if text and remaining <= remaining_chinese_limit:
             stable = True
             for sample in range(2):
-                _pace(pause_event, cancel)
+                clock.now()
                 if cancel.is_set():
                     raise InterruptedError("Translation cancelled.")
                 page.wait_for_timeout(750)
+                clock.now()
                 latest = page.locator("body").inner_text(timeout=5_000).strip()
                 if latest != text or chinese_count(latest) > remaining_chinese_limit:
                     stable = False
@@ -218,8 +244,57 @@ def wait_for_translation(
                 if report_progress is not None:
                     report_progress(chinese_count(text) / original_count if original_count else 0.0)
                 return text
+            remaining = chinese_count(text)
+        now = clock.now()
+        action, reason = watchdog.observe(remaining, now, has_text=bool(text))
+        if action:
+            report(
+                f"Translation watchdog: {reason}; action={action}, elapsed={now - started:.1f}s active, "
+                f"remaining={remaining:,}/{original_count:,}, best={watchdog.best:,}, "
+                f"no improvement={now - watchdog.last_improvement:.1f}s."
+            )
+            clock.now()
+            # A mostly translated page that stops improving needs review, not a reload that discards it.
+            if (
+                cleanup
+                and action != "reactivate"
+                and reason != "confirmed rollback"
+                and bool(text)
+                and remaining <= original_count * CLEANUP_REVIEW_MAX_RATIO
+            ):
+                report(
+                    f"Targeted cleanup stalled at {remaining:,} Chinese characters; "
+                    "sending result for review."
+                )
+                return text
+            if action == "exhausted":
+                raise TimeoutError("Translation recovery exhausted for this chunk attempt.")
+            if action == "reactivate":
+                activated = retry_translation()
+                finished = clock.now()
+                watchdog.cooldown_until = finished + watchdog.RECOVERY_WAIT
+                watchdog.recovery_until = watchdog.cooldown_until
+                report(f"Chrome Translate reactivation returned {activated}; waiting {watchdog.RECOVERY_WAIT:g}s before further recovery.")
+            else:
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=CHROME_GOTO_TIMEOUT_MS)
+                    clock.now()
+                    page.evaluate("() => { delete document.documentElement.dataset.noveltlTarget; window.scrollTo(0, 0); }")
+                except Exception as exc:
+                    report(f"Chrome current-chunk reload failed ({type(exc).__name__}): {exc}")
+                    raise
+                now = clock.now()
+                watchdog.reset_page(now)
+                translation_started = False
+                cleanup = False
+                pass_number = 1
+                next_scroll = next_stats = now
+                report("Reloaded current chunk; reset count history, stability checks and scroll position (recovery budget retained).")
             continue
-        now = time.monotonic()
+        # Observe counts during recovery, but never compete with Translate by scrolling.
+        if now < watchdog.cooldown_until or watchdog.recovery_until is not None:
+            time.sleep(0.05)
+            continue
         if report_progress is not None and original_count > 0 and now >= next_stats:
             report_progress(remaining / original_count)
             next_stats = now + 1.0
@@ -233,13 +308,6 @@ def wait_for_translation(
                 translation_started = True
                 report("Chrome translation detected; starting uninterrupted scrolling.")
                 next_scroll = now
-            elif now >= next_retry:
-                report("Translation has not started; retrying Chrome Translate.")
-                retry_translation()
-                try:
-                    next_retry = started + next(retry_delays)
-                except StopIteration:
-                    next_retry = float("inf")
 
         if translation_started and now >= next_scroll:
             scroll_state = page.evaluate(
@@ -276,20 +344,8 @@ def wait_for_translation(
                     f"Finished scan {pass_number}: {remaining:,}/{original_count:,} "
                     "Chinese characters remain."
                 )
-                if cleanup:
-                    stalled_rounds = 0 if remaining < best_remaining else stalled_rounds + 1
-                    best_remaining = min(best_remaining, remaining)
-                    if stalled_rounds >= 3:
-                        if cleanup_retried:
-                            report("Targeted cleanup stalled after retry; sending result for review.")
-                            return text
-                        report("Targeted cleanup stalled; retrying Chrome Translate once.")
-                        retry_translation()
-                        cleanup_retried = True
-                        stalled_rounds = 0
-                else:
+                if not cleanup:
                     cleanup = True
-                    best_remaining = remaining
                     report("Initial sweep complete; targeting remaining Chinese paragraphs.")
                 pass_number += 1
             interval = get_scroll_interval()

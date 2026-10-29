@@ -9,17 +9,62 @@ let currentStats = { speed: null, eta: null, currentPct: 0 };
 let outputFolder = '';
 let coverImage = null;
 let cropState = null;
+let previewGeneration = 0;
+let sourcePreview = null;
+let checkpointRequest = 0;
+let titleGeneration = 0;
+let titleWorking = false;
+
+function invalidateTitle() {
+  titleGeneration++;
+  element('title-status').textContent = '';
+  if (titleWorking && api) void api.cancelTitle().catch(() => {});
+}
+
+async function suggestTitle() {
+  if (element('suggest-title').disabled) return;
+  const generation = ++titleGeneration;
+  const original = element('name').value;
+  const input = element('input').value;
+  titleWorking = true;
+  element('title-status').textContent = 'Translating filename with Chrome…';
+  controls();
+  try {
+    const title = await api.suggestTitle();
+    if (generation !== titleGeneration || input !== element('input').value || isFixMode() || original !== element('name').value) return;
+    element('name').value = title;
+    element('original-name').checked = false;
+    localStorage.setItem('original-name', 'false');
+    element('title-status').textContent = 'Suggestion ready. Review or edit the translation name.';
+    syncOutput();
+    checkForCheckpoint();
+  } catch (error) {
+    if (generation !== titleGeneration) return;
+    element('title-status').textContent = `${error.message} Your current name was kept.`;
+  } finally {
+    titleWorking = false;
+    controls();
+    checkForCheckpoint();
+  }
+}
+
 
 loadSettings();
+element('encoding').onchange = refreshPreview;
+element('refresh-preview').onclick = refreshPreview;
+element('confirm-encoding').onchange = () => { controls(); checkForCheckpoint(); };
 applyTheme();
 element('night').onchange = () => { applyTheme(); localStorage.setItem('theme', document.documentElement.dataset.theme); };
 for (const radio of document.querySelectorAll('[name="mode"]')) radio.onchange = toggleMode;
+element('suggest-title').onclick = suggestTitle;
+element('cancel-title').onclick = () => { invalidateTitle(); element('title-status').textContent = 'Cancelling suggestion…'; };
 element('original-name').onchange = () => {
+  invalidateTitle();
   localStorage.setItem('original-name', element('original-name').checked);
   if (element('original-name').checked && sourceName()) element('name').value = sourceName() + nameSuffix();
   syncOutput();
 };
-element('name').oninput = () => { element('original-name').checked = false; localStorage.setItem('original-name', 'false'); syncOutput(); };
+element('name').oninput = () => { invalidateTitle(); element('original-name').checked = false; localStorage.setItem('original-name', 'false'); syncOutput(); checkForCheckpoint(); };
 element('preset').onchange = () => {
   const isCustom = element('preset').value === 'custom';
   element('custom-chunk-wrapper').style.display = isCustom ? 'block' : 'none';
@@ -119,6 +164,8 @@ function toggleMode() {
   element('retry').hidden = fix;
   element('pause').hidden = fix;
   element('input').value = '';
+  resetPreview();
+  element('encoding').value = 'auto';
   element('checkpoint-status').textContent = '';
   if (element('original-name').checked) element('name').value = '';
   syncOutput();
@@ -129,7 +176,10 @@ function nameSuffix() {
 }
 
 function outputName() {
-  return element('name').value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '').replace(/\.epub$/i, '');
+  let name = element('name').value.trim().replace(/\.epub$/i, '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 180).replace(/[. ]+$/, '');
+  if (/[\uD800-\uDBFF]$/.test(name)) name = name.slice(0, -1);
+  if (/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?: *\.|$)/i.test(name)) name = '_' + name;
+  return name.slice(0, 180).replace(/[. ]+$/, '');
 }
 
 function getChunkSize() {
@@ -173,15 +223,21 @@ function controls() {
   const customChunkValid = fix || element('preset').value !== 'custom' || (element('custom-chunk').value && element('custom-chunk').checkValidity());
   const translateValid = fix || (element('scroll-interval').value && element('scroll-interval').checkValidity() && element('chinese-limit').checkValidity());
   const coverValid = document.querySelector('[name="cover-mode"]:checked')?.value !== 'import' || Boolean(coverImage);
-  element('start').disabled = !ready || busy || !element('input').value || !element('output').value || !outputName() || !translateValid || !customChunkValid || !coverValid;
+  const encodingValid = fix || Boolean(sourcePreview && element('confirm-encoding').checked);
+  element('suggest-title').disabled = !ready || busy || titleWorking || fix || !element('input').value;
+  element('cancel-title').disabled = !titleWorking;
+  element('start').disabled = !ready || busy || titleWorking || !element('input').value || !element('output').value || !outputName() || !translateValid || !customChunkValid || !coverValid || !encodingValid;
+  element('encoding').disabled = !ready || busy;
+  element('refresh-preview').disabled = !ready || busy || !element('input').value;
+  element('confirm-encoding').disabled = !ready || busy || !sourcePreview;
   for (const id of ['pick-input', 'pick-output', 'preset', 'name', 'original-name', 'chinese-limit', 'custom-chunk', 'pick-cover']) element(id).disabled = !ready || busy;
   for (const radio of document.querySelectorAll('[name="mode"], [name="cover-mode"]')) radio.disabled = busy;
   for (const id of ['scroll-interval', 'scroll-slider']) element(id).disabled = !ready;
   element('pause').disabled = !busy;
   element('cancel').disabled = !busy;
-  element('retry').disabled = !ready || busy;
+  element('retry').disabled = element('start').disabled;
   element('pause').textContent = paused ? 'Resume' : 'Pause';
-  element('restart-backend').disabled = ready && busy;
+  element('restart-backend').disabled = ready && (busy || titleWorking);
   element('export-diagnostics').disabled = busy;
 }
 
@@ -190,12 +246,46 @@ async function command(message) {
   catch (error) { setNotice(error.message); log(error.message); return false; }
 }
 
+function resetPreview() {
+  invalidateTitle();
+  previewGeneration++;
+  checkpointRequest++;
+  sourcePreview = null;
+  element('confirm-encoding').checked = false;
+  element('confirm-encoding').disabled = true;
+  element('text-preview').textContent = '';
+  element('encoding-status').textContent = 'Select a TXT file to preview.';
+  element('checkpoint-status').textContent = '';
+  if (api) void api.cancelPreview().catch(() => {});
+}
+
+async function refreshPreview() {
+  resetPreview();
+  const generation = previewGeneration;
+  controls();
+  if (isFixMode() || !ready || !element('input').value) return;
+  element('encoding-status').textContent = 'Validating the entire file…';
+  try {
+    const preview = await api.previewText(element('encoding').value);
+    if (generation !== previewGeneration) return;
+    sourcePreview = preview;
+    element('text-preview').textContent = preview.preview;
+    element('encoding-status').textContent = `${preview.encoding} · ${preview.characters.toLocaleString()} characters · Whole file validated. ${preview.truncated ? 'Showing the first 4,000 characters. ' : ''}${preview.warnings.join(' ')} Review and confirm before translating.`;
+  } catch (error) {
+    if (generation !== previewGeneration) return;
+    element('encoding-status').textContent = error.message;
+  }
+  controls();
+}
+
 async function pickFile(kind) {
   try {
     const selected = await api.pick(kind === 'input' && isFixMode() ? 'epub' : kind);
     if (selected) {
       if (kind === 'input') {
         element('input').value = selected;
+        element('encoding').value = 'auto';
+        void refreshPreview();
         if (element('original-name').checked || !element('name').value) element('name').value = sourceName() + nameSuffix();
         syncOutput();
         checkForCheckpoint();
@@ -210,16 +300,18 @@ async function pickFile(kind) {
 }
 
 async function checkForCheckpoint() {
-  if (isFixMode() || !element('input').value || !outputFolder || !outputName()) {
+  const requestId = ++checkpointRequest;
+  if (busy || titleWorking || isFixMode() || !sourcePreview || !element('confirm-encoding').checked || !element('input').value || !outputFolder || !outputName()) {
     element('checkpoint-status').textContent = '';
     return;
   }
   try {
-    await command({ kind: 'checkpoint_status', input: element('input').value, output: element('output').value, chunkLimit: getChunkSize() });
+    await command({ kind: 'checkpoint_status', requestId, input: element('input').value, output: element('output').value, chunkLimit: getChunkSize(), encoding: sourcePreview.encoding, digest: sourcePreview.digest });
   } catch {}
 }
 
 async function start() {
+  if (element('start').disabled) return;
   resetRun();
   busy = true;
   paused = false;
@@ -230,7 +322,7 @@ async function start() {
     : { mode: 'import', imagePath: coverImage || null, crop: cropRegion() };
   const message = isFixMode()
     ? { kind: 'fix_epub', input: element('input').value, output: element('output').value, cover: coverOptions }
-    : { kind: 'start', input: element('input').value, output: element('output').value, chunkLimit: getChunkSize(), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions };
+    : { kind: 'start', input: element('input').value, output: element('output').value, encoding: sourcePreview.encoding, digest: sourcePreview.digest, chunkLimit: getChunkSize(), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions };
   if (await command(message)) {
     started = Date.now();
     element('status').textContent = 'Running';
@@ -272,10 +364,13 @@ async function sendDecision(decision) {
 async function restartBackend() {
   try {
     await api.restartBackend();
+    resetPreview();
+    element('input').value = '';
     ready = false;
     busy = false;
     element('connection').textContent = 'Restarting backend...';
     setNotice('Backend is restarting');
+    controls();
   } catch (error) { setNotice(error.message); }
 }
 
@@ -344,6 +439,8 @@ function setupDragDrop() {
     if (!file) { setNotice(`Drop a ${wanted} file`); return; }
     try {
       element('input').value = await api.dropInput(file);
+      element('encoding').value = 'auto';
+      void refreshPreview();
     } catch (error) {
       setNotice(error.message);
       return;
@@ -356,6 +453,7 @@ function setupDragDrop() {
 }
 
 function handleEvent({ kind, value }) {
+  if (kind === 'title_idle') { titleWorking = false; checkForCheckpoint(); }
   if (kind === 'ready') {
     ready = true;
     element('connection').textContent = 'Python connected';
@@ -398,7 +496,11 @@ function handleEvent({ kind, value }) {
     element('reason').textContent = `Chunk ${value.index}: ${value.reason}`;
     element('validation').showModal();
   }
-  if (kind === 'checkpoint_status') {
+  if (kind === 'checkpoint_status' && value.requestId === checkpointRequest) {
+    if (value.error?.includes('Source changed since preview')) {
+      resetPreview();
+      element('encoding-status').textContent = value.error;
+    }
     if (value.exists) element('checkpoint-status').textContent = `Resume: ${value.completed}/${value.total} chunks saved`;
     else element('checkpoint-status').textContent = '';
   }
@@ -415,6 +517,7 @@ function handleEvent({ kind, value }) {
     element('retry').disabled = false;
   }
   if (['error', 'command_error', 'offline'].includes(kind)) {
+    if (String(value).includes('Source changed since preview')) resetPreview();
     element('status').textContent = 'Stopped';
     setNotice(String(value));
     log(value);
@@ -425,6 +528,8 @@ function handleEvent({ kind, value }) {
     paused = false;
   }
   if (kind === 'offline') {
+    titleWorking = false;
+    resetPreview();
     ready = false;
     element('connection').textContent = 'Backend offline';
   }

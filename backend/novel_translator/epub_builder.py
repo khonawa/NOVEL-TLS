@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import io
 import logging
+import os
+import uuid
 import re
 import time
 from pathlib import Path
@@ -525,12 +527,14 @@ def make_epub(text: str, output: Path, book_title: str, cover_options: dict | No
     for item in items:
         item.add_item(style)
     output.parent.mkdir(parents=True, exist_ok=True)
-    # Write to a temp file then atomically replace, so a crash mid-write can
-    # never leave a corrupt half-written EPUB at the destination.
-    temporary = output.with_suffix(output.suffix + ".tmp")
+    # Publish atomically without replacing a file created while translation ran.
+    temporary = output.with_name(f".{uuid.uuid4().hex}.epub")
     try:
         epub.write_epub(str(temporary), book, {'epub3_landmark': False, 'epub3_pages': False})
-        temporary.replace(output)
+        if os.name == "nt":
+            temporary.rename(output)  # Windows rename refuses an existing destination.
+        else:
+            os.link(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
 

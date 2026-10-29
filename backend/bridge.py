@@ -12,8 +12,9 @@ from pathlib import Path
 try:
     from novel_translator.pipeline import PipelineContext, QueueHandler, TranslationRunner
     from novel_translator.checkpoint import checkpoint_dir_for, load_checkpoint
-    from novel_translator.text_processing import source_fingerprint
-    from novel_translator.constants import CHUNK_PRESETS
+    from novel_translator.text_processing import source_fingerprint, read_text_file
+    from novel_translator.encoding import decode_source, ENCODINGS
+    from novel_translator.constants import CHUNK_PRESETS, sanitize_filename
 except ImportError as error:
     print(json.dumps({"kind": "error", "value": f"Missing dependency: {error.name}. Install with: pip install -r requirements.txt"}, ensure_ascii=True), flush=True)
     sys.exit(1)
@@ -30,6 +31,10 @@ class Bridge:
         self.decisions = queue.Queue()
         self.thread = None
         self.scroll_interval = 0.5
+        self.preview_cancel = threading.Event()
+        self.preview_thread = None
+        self.title_cancel = threading.Event()
+        self.title_thread = None
 
     def decide(self, index, reason):
         self.emit("validation", {"index": index, "reason": reason})
@@ -42,7 +47,23 @@ class Bridge:
 
     def command(self, message):
         kind = message.get("kind")
-        if kind == "settings":
+        if kind == "cancel_title":
+            self.title_cancel.set()
+        elif kind == "suggest_title":
+            if (self.thread and self.thread.is_alive()) or (self.title_thread and self.title_thread.is_alive()):
+                raise ValueError("A browser operation is already running.")
+            self.title_cancel = threading.Event()
+            self.title_thread = threading.Thread(target=self.run_title, args=(message, self.title_cancel), daemon=True)
+            self.title_thread.start()
+        elif kind in ("preview", "cancel_preview"):
+            self.preview_cancel.set()
+            if kind == "cancel_preview":
+                return
+            self.preview_cancel = threading.Event()
+            previous = self.preview_thread
+            self.preview_thread = threading.Thread(target=self.preview, args=(message, self.preview_cancel, previous), daemon=True)
+            self.preview_thread.start()
+        elif kind == "settings":
             try:
                 interval = float(message["scrollInterval"])
                 if not 0.1 <= interval <= 5:
@@ -56,20 +77,20 @@ class Bridge:
             output = Path(message["output"])
             limit = int(message.get("chunkLimit", 275000))
             if not source.is_file():
-                self.emit("checkpoint_status", {"exists": False})
+                self.emit("checkpoint_status", {"exists": False, "requestId": message.get("requestId")})
                 return
             try:
-                source_text = source.read_text(encoding="utf-8")
+                source_text = read_text_file(source, message.get("encoding", "auto"), message.get("digest"))
                 from novel_translator.text_processing import split_text
                 chunks = split_text(source_text, limit)
                 progress_dir = checkpoint_dir_for(output)
                 fingerprint = source_fingerprint(f"{limit}\0{source_text}")
                 completed = load_checkpoint(progress_dir, fingerprint, len(chunks))
-                self.emit("checkpoint_status", {"exists": bool(completed), "completed": len(completed), "total": len(chunks)})
-            except Exception:
-                self.emit("checkpoint_status", {"exists": False})
+                self.emit("checkpoint_status", {"exists": bool(completed), "completed": len(completed), "total": len(chunks), "requestId": message.get("requestId")})
+            except Exception as error:
+                self.emit("checkpoint_status", {"exists": False, "error": str(error), "requestId": message.get("requestId")})
         elif kind == "start":
-            if self.thread and self.thread.is_alive():
+            if (self.title_thread and self.title_thread.is_alive()) or (self.thread and self.thread.is_alive()):
                 raise ValueError("A translation is already running.")
             errors = _validate_start_command(message)
             if errors:
@@ -95,11 +116,13 @@ class Bridge:
                 chunk_limit=limit,
                 remaining_chinese_limit=remaining_limit,
                 cover_options=cover_options,
+                source_encoding=message.get("encoding", "auto"),
+                source_digest=message.get("digest"),
             )
             self.thread = threading.Thread(target=self.run, args=(context, source, output))
             self.thread.start()
         elif kind == "fix_epub":
-            if self.thread and self.thread.is_alive():
+            if (self.title_thread and self.title_thread.is_alive()) or (self.thread and self.thread.is_alive()):
                 raise ValueError("A run is already active.")
             source = Path(message["input"])
             output = Path(message["output"])
@@ -107,6 +130,9 @@ class Bridge:
                 raise ValueError(f"Source must be an existing EPUB file: {source}")
             if output.suffix.lower() != ".epub" or not output.parent.is_dir():
                 raise ValueError("Choose an EPUB destination in an existing folder.")
+            output = output.with_name(sanitize_filename(output.stem) + '.epub')
+            if output.exists():
+                raise FileExistsError("EPUB already exists; choose another name.")
             if output.resolve() == source.resolve():
                 raise ValueError("Destination must differ from the source EPUB.")
             cover_options = message.get("cover") or {"mode": "auto", "textColor": "#ffffff", "bgColor": "#0f131c"}
@@ -127,6 +153,33 @@ class Bridge:
             self.decisions.put(decision)
         else:
             raise ValueError("Unknown command.")
+
+    def run_title(self, message, cancel):
+        reply = {"requestId": message.get("requestId")}
+        try:
+            from novel_translator.title import suggest_title
+            reply["title"] = suggest_title(Path(message["input"]), cancel)
+        except Exception as error:
+            reply["error"] = str(error)
+        self.title_thread = None
+        self.emit("title_result", reply)
+
+    def preview(self, message, cancel, previous):
+        if previous:
+            previous.join()
+        if cancel.is_set():
+            return
+        reply = {"requestId": message.get("requestId")}
+        try:
+            source = Path(message["input"])
+            if source.suffix.lower() != ".txt":
+                raise ValueError("Choose a plain-text TXT file.")
+            _, metadata = decode_source(source, message.get("encoding", "auto"), cancel=cancel)
+            reply.update(metadata)
+        except Exception as error:
+            reply["error"] = str(error)
+        if not cancel.is_set():
+            self.emit("preview_result", reply)
 
     def run(self, context, source, output):
         handler = QueueHandler(self.events)
@@ -182,9 +235,13 @@ def _validate_start_command(message):
         errors.append(f"Source must be a TXT file: {source}")
     if output.suffix.lower() != ".epub" or not output.parent.is_dir():
         errors.append("Choose an EPUB destination in an existing folder.")
+    if output.exists():
+        errors.append("EPUB already exists; choose another name.")
     limit = int(message.get("chunkLimit", 275000))
     if limit not in CHUNK_PRESETS.values():
         errors.append("Unknown chunk preset.")
+    if message.get("encoding", "auto") not in ("auto", *ENCODINGS):
+        errors.append("Unsupported source encoding.")
     remaining_limit = message.get("remainingChineseLimit", 50)
     if type(remaining_limit) is not int or remaining_limit < 0:
         errors.append("Chinese character tolerance must be a nonnegative whole number.")
@@ -215,6 +272,10 @@ def main():
             bridge.command(json.loads(line))
         except Exception as error:
             emit("command_error", str(error))
+    bridge.command({"kind": "cancel_title"})
+    if bridge.title_thread:
+        bridge.title_thread.join()
+    bridge.command({"kind": "cancel_preview"})
     bridge.command({"kind": "cancel"})
     if bridge.thread:
         bridge.thread.join()
