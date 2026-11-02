@@ -57,12 +57,15 @@ def translation_failed(page):
         return False
 
 
-def translate_page(page, source, cancel, retry):
+def translate_page(page, source, cancel, retry, report=lambda _: None):
     previous = None
     stable = 0
     started = time.monotonic()
     deadline = started + 25
     retried = False
+    recovery_until = None
+    failed = False
+    report('reading translated title')
     while time.monotonic() < deadline:
         if cancel.is_set():
             raise InterruptedError("Title translation cancelled.")
@@ -77,20 +80,23 @@ def translate_page(page, source, cancel, retry):
                 return title
         previous = candidate
         # Page-wide translated CSS is not proof that this short title changed.
-        if translation_failed(page):
-            raise TitleTranslationError('failed')
-        if not retried and time.monotonic() - started >= 5:
+        failed = translation_failed(page)
+        now = time.monotonic()
+        if not retried and (failed or now - started >= 5):
+            report('retrying filename translation' if failed else 'activating translation')
             activated = retry()
             if cancel.is_set():
                 raise InterruptedError("Title translation cancelled.")
-            if translation_failed(page):
-                raise TitleTranslationError('failed')
             if not activated:
                 raise TitleTranslationError('activation')
             retried = True
-            # UI automation consumes the same budget; never restart the deadline.
+            # A stale error bubble can remain while Chrome starts the new request.
+            recovery_until = min(deadline, now + 5)
+            report('waiting for filename translation recovery')
+        elif retried and failed and recovery_until is not None and now >= recovery_until and stable == 0:
+            raise TitleTranslationError('failed')
         page.wait_for_timeout(500)
-    raise TitleTranslationError('stalled')
+    raise TitleTranslationError('failed' if failed else 'stalled')
 
 
 def report_stage(work: Path, stage: str) -> None:
@@ -103,7 +109,7 @@ def last_stage(work: Path, fallback: str) -> str:
         stage = (work / 'stage').read_text(encoding='utf-8')
     except OSError:
         return fallback
-    if stage in {'importing title dependencies', 'starting Playwright', 'waiting for title request', 'starting Chrome', 'loading title page', 'activating translation', 'reading translated title', 'closing Chrome', 'stopping local server'}:
+    if stage in {'importing title dependencies', 'starting Playwright', 'waiting for title request', 'starting Chrome', 'loading title page', 'activating translation', 'retrying filename translation', 'waiting for filename translation recovery', 'reading translated title', 'closing Chrome', 'stopping local server'}:
         return stage
     return fallback
 
@@ -151,7 +157,7 @@ def chrome_title(source: str | None, work: Path) -> str | None:
                     report_stage(work, 'reading translated title')
                     return activated
                 report_stage(work, 'reading translated title')
-                return translate_page(page, source, threading.Event(), retry)
+                return translate_page(page, source, threading.Event(), retry, lambda stage: report_stage(work, stage))
             finally:
                 report_stage(work, 'closing Chrome')
                 context.close()
@@ -205,7 +211,7 @@ def await_ready(process, cancel, deadline, work):
         raise InterruptedError('Title translation cancelled.')
 
 
-def suggest_title(source: Path, cancel: threading.Event, timeout: float = 90) -> str:
+def suggest_title(source: Path, cancel: threading.Event, timeout: float = 90, report=lambda _: None) -> str:
     if not source.is_file() or source.suffix.lower() != ".txt":
         raise ValueError("Select an existing TXT source first.")
     work = Path(__file__).resolve().parents[1] / (".title-" + uuid.uuid4().hex)
@@ -227,7 +233,10 @@ def suggest_title(source: Path, cancel: threading.Event, timeout: float = 90) ->
                 break
             except subprocess.TimeoutExpired:
                 request = None
-                stage = last_stage(work, stage)
+                latest = last_stage(work, stage)
+                if latest != stage:
+                    stage = latest
+                    report(stage)
         if process.returncode:
             # Only structured, allowlisted errors cross the worker boundary.
             try:

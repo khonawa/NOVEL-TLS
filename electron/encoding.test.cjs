@@ -7,9 +7,10 @@ const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
 const timers = require('node:timers');
 
-async function harness(timerApi) {
+async function harness(timerApi, archiveApi) {
   const handlers = {};
   const children = [];
+  const events = [];
   let win;
   class Window extends EventEmitter {
     constructor(options) {
@@ -18,9 +19,11 @@ async function harness(timerApi) {
       this.options = options;
       this.webContents = new EventEmitter();
       this.webContents.setWindowOpenHandler = () => {};
-      this.webContents.send = () => {};
+      this.webContents.send = (_, event) => events.push(event);
     }
     loadFile() {}
+    setProgressBar() {}
+    isFocused() { return true; }
     isDestroyed() { return false; }
   }
   const electron = {
@@ -35,6 +38,7 @@ async function harness(timerApi) {
     process: { env: {} },
     require: name => {
       if (name === 'electron') return electron;
+      if (name === './archive.cjs') return archiveApi || require('./archive.cjs');
       if (name === 'node:timers' && timerApi) return timerApi;
       if (name === 'node:fs') return { existsSync: () => true, statSync: () => ({ isFile: () => true, isDirectory: () => true }), readFileSync: () => '{}', writeFileSync: () => {} };
       if (name === 'node:child_process') return { spawn: () => {
@@ -55,7 +59,7 @@ async function harness(timerApi) {
   win.webContents.emit('did-finish-load');
   const call = (name, value) => handlers[name]({}, value);
   const respond = (child, value) => child.stdout.write(JSON.stringify({ kind: 'preview_result', value }) + '\n');
-  return { call, children, win, respond };
+  return { call, children, win, respond, events };
 }
 
 test('preview authorization, correlation, selection invalidation and sandbox', async () => {
@@ -120,6 +124,77 @@ test('preview errors, cancellation and backend failures settle requests', async 
   child.emit('close', 1);
   await failed;
   assert.throws(() => call('text-preview', 'auto'), /unavailable/);
+});
+
+test('archive completion holds the run lock through idle and preserves EPUB on failure', async () => {
+  let finish;
+  const calls = [];
+  const h = await harness(null, {
+    captureOriginal: (...args) => { calls.push(args); return { source: args[0] }; },
+    archiveOriginal: () => new Promise((_, reject) => { finish = reject; })
+  });
+  const child = h.children[0];
+  h.call('drop-input', 'C:\\books\\novel.txt');
+  const preview = h.call('text-preview', 'utf-8');
+  h.respond(child, { requestId: child.messages.at(-1).requestId, encoding: 'utf-8', digest: 'hash' });
+  await preview;
+  await h.call('pick', 'output');
+  await h.call('pick', 'archive');
+  h.call('command', { kind: 'start', input: 'C:\\books\\novel.txt', output: 'C:\\books\\novel.epub', encoding: 'utf-8', digest: 'hash', moveOriginal: true });
+  assert.equal(calls.length, 1);
+  const emit = kind => child.stdout.write(JSON.stringify({ kind, value: 'C:\\books\\novel.epub' }) + '\n');
+  emit('done');
+  emit('idle');
+  assert.equal(h.events.some(event => event.kind === 'idle'), false);
+  assert.throws(() => h.call('restart-backend'), /active operation/);
+  let prevented = false;
+  h.win.emit('close', { preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, true);
+  finish(new Error('locked'));
+  await new Promise(resolve => timers.setImmediate(resolve));
+  assert.ok(h.events.some(event => event.kind === 'done'));
+  assert.ok(h.events.some(event => event.kind === 'archive_warning' && event.value.includes('locked')));
+  assert.equal(h.events.at(-1).kind, 'idle');
+});
+
+test('successful archive reports destination once, invalidates source and waits for backend idle', async () => {
+  let finish;
+  let moves = 0;
+  const h = await harness(null, { captureOriginal: () => ({}), archiveOriginal: () => { moves++; return new Promise(resolve => { finish = resolve; }); } });
+  const child = h.children[0];
+  h.call('drop-input', 'C:\\books\\novel.txt');
+  const preview = h.call('text-preview', 'utf-8');
+  h.respond(child, { requestId: child.messages.at(-1).requestId, encoding: 'utf-8', digest: 'hash' });
+  await preview;
+  await h.call('pick', 'output');
+  h.call('command', { kind: 'start', input: 'C:\\books\\novel.txt', output: 'C:\\books\\novel.epub', encoding: 'utf-8', digest: 'hash', moveOriginal: true });
+  for (let i = 0; i < 2; i++) child.stdout.write(JSON.stringify({ kind: 'done', value: 'C:\\books\\novel.epub' }) + '\n');
+  assert.equal(moves, 1);
+  finish('C:\\completed\\novel.txt');
+  await new Promise(resolve => timers.setImmediate(resolve));
+  assert.ok(h.events.some(event => event.kind === 'original_archived' && event.value.destination === 'C:\\completed\\novel.txt'));
+  assert.throws(() => h.call('restart-backend'), /active operation/);
+  child.stdout.write(JSON.stringify({ kind: 'idle' }) + '\n');
+  assert.throws(() => h.call('text-preview', 'utf-8'), /Select a TXT/);
+});
+
+test('cancelled, incomplete, failed, disabled and EPUB-fix jobs never archive', async () => {
+  for (const outcome of ['cancel', 'incomplete', 'error', 'disabled', 'fix']) {
+    let moved = false;
+    const h = await harness(null, { captureOriginal: () => ({}), archiveOriginal: async () => { moved = true; } });
+    const child = h.children[0];
+    h.call('drop-input', 'C:\\books\\novel.txt');
+    const preview = h.call('text-preview', 'utf-8');
+    h.respond(child, { requestId: child.messages.at(-1).requestId, encoding: 'utf-8', digest: 'hash' });
+    await preview;
+    await h.call('pick', 'output');
+    h.call('command', { kind: outcome === 'fix' ? 'fix_epub' : 'start', input: 'C:\\books\\novel.txt', output: 'C:\\books\\novel.epub', encoding: 'utf-8', digest: 'hash', moveOriginal: outcome !== 'disabled' });
+    if (outcome === 'cancel') h.call('command', { kind: 'cancel' });
+    if (['error', 'incomplete'].includes(outcome)) child.stdout.write(JSON.stringify({ kind: outcome, value: 1 }) + '\n');
+    child.stdout.write(JSON.stringify({ kind: 'done', value: 'C:\\books\\novel.epub' }) + '\n');
+    await new Promise(resolve => timers.setImmediate(resolve));
+    assert.equal(moved, false, outcome);
+  }
 });
 
 test('old backend close cannot disconnect restarted worker', async () => {

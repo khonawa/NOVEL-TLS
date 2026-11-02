@@ -11,17 +11,34 @@ from novel_translator.epub_builder import make_epub
 
 
 class TitleTests(unittest.TestCase):
-    def test_native_failure_is_not_an_untranslated_title_stall(self):
+    def title_clock(self, page):
+        clock = Mock()
+        clock.now = 0
+        def wait(milliseconds):
+            clock.now += milliseconds / 1000
+        page.wait_for_timeout.side_effect = wait
+        return clock
+
+    def test_transient_failure_retries_and_accepts_stable_english_despite_lingering_bubble(self):
         page = Mock()
-        page._novel_chrome_pid = 123
+        page.locator.return_value.inner_text.side_effect = ['山', 'Mountain', 'Mountain', 'Mountain']
+        clock = self.title_clock(page)
+        retry = Mock(return_value=True)
+        with patch('novel_translator.title.time.monotonic', side_effect=lambda: clock.now), patch('novel_translator.title.translation_failed', return_value=True):
+            self.assertEqual(translate_page(page, '山', threading.Event(), retry), 'Mountain')
+        retry.assert_called_once()
+
+    def test_persistent_failure_gets_recovery_period_and_only_one_retry(self):
+        page = Mock()
         page.locator.return_value.inner_text.return_value = '山'
-        desktop = Mock()
-        desktop.return_value.window.return_value.child_window.return_value.exists.return_value = True
-        retry = Mock()
-        with patch('novel_translator.chrome._get_desktop_class', return_value=desktop):
+        clock = self.title_clock(page)
+        retry = Mock(return_value=True)
+        with patch('novel_translator.title.time.monotonic', side_effect=lambda: clock.now), patch('novel_translator.title.translation_failed', return_value=True):
             with self.assertRaisesRegex(RuntimeError, 'could not be translated'):
                 translate_page(page, '山', threading.Event(), retry)
-        retry.assert_not_called()
+        retry.assert_called_once()
+        self.assertGreaterEqual(clock.now, 5)
+        self.assertLessEqual(clock.now, 25)
 
     def test_native_title_activation_requires_english_even_with_retry_button(self):
         from novel_translator.chrome import automate_chrome_translation

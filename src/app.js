@@ -76,6 +76,14 @@ async function suggestTitle() {
 
 loadSettings();
 element('worker-count').onchange = () => localStorage.setItem('worker-count', element('worker-count').value);
+element('move-original').onchange = () => { localStorage.setItem('move-original', element('move-original').checked); controls(); };
+element('pick-archive').onclick = async () => {
+  try {
+    const folder = await api.pick('archive');
+    if (folder) element('archive-folder').value = folder;
+    controls();
+  } catch (error) { setNotice(error.message); }
+};
 element('encoding').onchange = refreshPreview;
 element('refresh-preview').onclick = refreshPreview;
 element('confirm-encoding').onchange = () => { controls(); checkForCheckpoint(); };
@@ -138,6 +146,7 @@ setupDragDrop();
 if (api) {
   api.onEvent(handleEvent);
   api.defaultOutput().then(folder => { if (folder) { outputFolder = folder; syncOutput(); } });
+  api.defaultArchive().then(folder => { if (folder) element('archive-folder').value = folder; controls(); }).catch(error => setNotice(error.message));
 } else {
   element('connection').textContent = 'Browser preview - translation unavailable';
   element('notice').textContent = 'No desktop backend connection. Open the NovelTL desktop window launched by npm start.';
@@ -145,6 +154,7 @@ if (api) {
 controls();
 
 function loadSettings() {
+  element('move-original').checked = localStorage.getItem('move-original') === 'true';
   const savedWorkers = localStorage.getItem('worker-count');
   element('worker-count').value = ['1', '2', '3'].includes(savedWorkers) ? savedWorkers : '1';
   const savedPreset = localStorage.getItem('preset');
@@ -255,6 +265,9 @@ function controls() {
   element('suggest-title').disabled = !ready || busy || titleWorking || fix || !element('input').value;
   element('cancel-title').disabled = !titleWorking;
   element('start').disabled = !ready || busy || titleWorking || !element('input').value || !element('output').value || !outputName() || !translateValid || !customChunkValid || !coverValid || !encodingValid;
+  if (!fix && element('move-original').checked && !element('archive-folder').value) element('start').disabled = true;
+  element('move-original').disabled = !ready || busy || fix;
+  element('pick-archive').disabled = !ready || busy || fix;
   element('encoding').disabled = !ready || busy;
   element('refresh-preview').disabled = !ready || busy || !element('input').value;
   element('confirm-encoding').disabled = !ready || busy || !sourcePreview;
@@ -350,7 +363,7 @@ async function start() {
     : { mode: 'import', imagePath: coverImage || null, crop: cropRegion() };
   const message = isFixMode()
     ? { kind: 'fix_epub', input: element('input').value, output: element('output').value, cover: coverOptions }
-    : { kind: 'start', input: element('input').value, output: element('output').value, encoding: sourcePreview.encoding, digest: sourcePreview.digest, chunkLimit: getChunkSize(), workerCount: Number(element('worker-count').value), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions };
+    : { kind: 'start', input: element('input').value, output: element('output').value, encoding: sourcePreview.encoding, digest: sourcePreview.digest, moveOriginal: element('move-original').checked, chunkLimit: getChunkSize(), workerCount: Number(element('worker-count').value), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions };
   if (await command(message)) {
     started = Date.now();
     element('status').textContent = 'Running';
@@ -496,6 +509,15 @@ function setupDragDrop() {
 }
 
 function handleEvent({ kind, value }) {
+  if (kind === 'title_status' && titleWorking) {
+    const messages = {
+      'retrying filename translation': 'Chrome reported a problem; retrying filename translation…',
+      'waiting for filename translation recovery': 'Waiting for translated filename after retry…',
+      'activating translation': 'Selecting English in Chrome…',
+      'reading translated title': 'Waiting for translated filename…'
+    };
+    element('title-status').textContent = messages[value] || `Filename translation: ${value}…`;
+  }
   if (kind === 'title_idle') { titleWorking = false; checkForCheckpoint(); }
   if (kind === 'ready') {
     ready = true;
@@ -561,6 +583,22 @@ function handleEvent({ kind, value }) {
     element('progress').value = 1;
     element('open').disabled = false;
     element('folder').disabled = false;
+  }
+  if (kind === 'archiving') {
+    element('status').textContent = 'Moving original';
+    setNotice('EPUB saved. Moving original to Completed Originals…');
+  }
+  if (kind === 'original_archived') {
+    element('status').textContent = 'Complete';
+    setNotice(`EPUB saved. Original moved to: ${value.destination}`);
+    log(`Original moved to: ${value.destination}`);
+    element('input').value = '';
+    resetPreview();
+  }
+  if (kind === 'archive_warning') {
+    element('status').textContent = 'Complete · archive warning';
+    setNotice(String(value));
+    log(value);
   }
   if (kind === 'incomplete') {
     element('status').textContent = 'Incomplete';

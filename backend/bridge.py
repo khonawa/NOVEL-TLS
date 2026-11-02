@@ -182,7 +182,13 @@ class Bridge:
         reply = {"requestId": message.get("requestId")}
         try:
             from novel_translator.title import suggest_title
-            reply["title"] = suggest_title(Path(message["input"]), cancel)
+            report = lambda stage: self.emit("title_status", {"requestId": message.get("requestId"), "stage": stage})
+            try:
+                reply["title"] = suggest_title(Path(message["input"]), cancel, report=report)
+            except TypeError as error:
+                if "unexpected keyword argument 'report'" not in str(error):
+                    raise
+                reply["title"] = suggest_title(Path(message["input"]), cancel)
         except Exception as error:
             reply["error"] = str(error)
         self.title_thread = None

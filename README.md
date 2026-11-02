@@ -37,6 +37,16 @@ Pause/resume and cancellation use the original pipeline's thread-safe controls.
 Validation failures offer retry, accept, or skip. Starting again with the same files and preset resumes checkpoints.
 Changing the preset changes checkpoint compatibility. Completed books can be opened or revealed in Explorer.
 
+### Move completed originals (optional)
+
+Enable **Move original after successful translation** and choose a separate **Completed Originals folder**. The option is off by default; the option and folder are remembered across restarts. It applies only to TXT translation, never EPUB fixing. Controls are locked during a run, and the source and archive folder are captured at start.
+
+Only a successfully saved EPUB triggers archiving. Cancelled, failed, or incomplete runs leave the original untouched. The archive preserves the filename/extension and uses numbered names such as `novel (1).txt` rather than overwriting existing files. The source is checked against the confirmed preview and rechecked before deletion; changed files are retained.
+
+Archiving uses an exclusive copy, SHA-256 verification, and a disk flush before deleting the original, including across drives. If copying or verification fails, the original remains. If deletion fails (for example, Windows has locked the source), both the verified copy and original remain and the warning identifies the copy. Archive failures do not invalidate the translated EPUB. The result displays the original's new location on success; select a new source for another run.
+
+Wait for archiving to finish before closing; normal closure/restart is blocked during this step. Forced termination or power loss can leave a partial or duplicate archive copy, but the source is not deliberately deleted before verification. This is not a backup system or protection against another program changing files at the exact instant of deletion. Large originals temporarily require space for both copies.
+
 ### Parallel Chrome workers (experimental)
 
 Choose **Parallel Chrome workers** before starting: **1** (default), **2**, or **3**. The selection is remembered and locked during a run. Each active worker owns a separate Chrome window, Playwright instance, and temporary profile, and processes pending chunks from the same book. Extra workers do not help a one-chunk book. More windows require more RAM; service/network limits can make additional workers slower rather than faster.

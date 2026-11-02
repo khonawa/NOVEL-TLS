@@ -10,6 +10,36 @@ let busy = false;
 let result;
 let folders = {};
 let allowedPaths = {};
+const { captureOriginal, archiveOriginal } = require('./archive.cjs');
+let archiveJob = null;
+let finalizing = false;
+let pendingIdle = false;
+let pendingOffline = null;
+
+async function finishArchive(output, job) {
+  try {
+    if (!fs.statSync(output, { throwIfNoEntry: false })?.isFile()) throw new Error('Saved EPUB is unavailable; original retained.');
+    const destination = await archiveOriginal(job);
+    allowedPaths.input = null;
+    validatedPreview = null;
+    send('original_archived', { destination });
+  } catch (error) {
+    send('archive_warning', `Translation complete. ${error.message}`);
+  } finally {
+    finalizing = false;
+    if (pendingOffline) {
+      busy = false;
+      pendingIdle = false;
+      send('offline', pendingOffline);
+      pendingOffline = null;
+    }
+    if (pendingIdle) {
+      pendingIdle = false;
+      busy = false;
+      send('idle', null);
+    }
+  }
+}
 const encodings = new Set(['auto', 'utf-8', 'utf-16-le', 'utf-16-be', 'utf-32-le', 'utf-32-be', 'gb2312', 'gbk', 'gb18030', 'big5', 'big5hkscs']);
 let previewSequence = 0;
 let pendingPreview;
@@ -69,6 +99,10 @@ function startWorker() {
     if (worker !== child) return;
     try {
       const event = JSON.parse(line);
+      if (event.kind === 'title_status') {
+        if (pendingTitle?.id === event.value.requestId && !pendingTitle.cancelReason) send('title_status', event.value.stage);
+        return;
+      }
       if (event.kind === 'title_result') {
         if (pendingTitle?.id !== event.value.requestId) return;
         finishTitle(event.value.error, event.value.title);
@@ -87,7 +121,9 @@ function startWorker() {
         }
         return;
       }
-      if (event.kind === 'idle' || event.kind === 'command_error') busy = false;
+      if (event.kind === 'idle' && finalizing) { pendingIdle = true; return; }
+      if (event.kind === 'idle' || event.kind === 'command_error') { busy = false; archiveJob = null; }
+      if (event.kind === 'error' || event.kind === 'incomplete') archiveJob = null;
       if (event.kind === 'done') {
         result = String(event.value);
         window?.setProgressBar(-1);
@@ -104,6 +140,13 @@ function startWorker() {
       }
       if (event.kind === 'progress' && typeof event.value === 'number') window?.setProgressBar(event.value);
       send(event.kind, event.value);
+      if (event.kind === 'done' && archiveJob) {
+        const job = archiveJob;
+        archiveJob = null;
+        finalizing = true;
+        send('archiving', null);
+        void finishArchive(result, job);
+      }
     } catch { send('log', line); }
   });
   readline.createInterface({ input: child.stderr }).on('line', line => { if (worker === child) send('log', line); });
@@ -112,6 +155,8 @@ function startWorker() {
     worker = null;
     finishTitle(message);
     invalidatePreview(message);
+    archiveJob = null;
+    if (finalizing) { pendingOffline = message; return; }
     busy = false;
     send('offline', message);
   };
@@ -128,6 +173,11 @@ app.whenReady().then(() => {
   window.loadFile(path.join(__dirname, '../src/index.html'));
   window.webContents.once('did-finish-load', startWorker);
   window.on('close', event => {
+    if (finalizing) {
+      event.preventDefault();
+      send('log', 'Wait for the original-file move to finish before closing.');
+      return;
+    }
     if (busy || pendingTitle) {
       const answer = dialog.showMessageBoxSync(window, { type: 'question', message: 'Cancel the active translation and close?', buttons: ['Keep translating', 'Cancel and close'], defaultId: 0, cancelId: 0 });
       if (answer === 0) { event.preventDefault(); return; }
@@ -137,6 +187,15 @@ app.whenReady().then(() => {
 });
 
 ipcMain.handle('pick', async (_, kind) => {
+  if (busy) throw new Error('Wait for the active run to finish.');
+  if (kind === 'archive') {
+    const selected = await dialog.showOpenDialog(window, { defaultPath: folders.archive || app.getPath('documents'), properties: ['openDirectory', 'createDirectory'] });
+    if (selected.canceled) return null;
+    if (busy) throw new Error('Wait for the active run to finish.');
+    rememberFolder('archive', path.join(selected.filePaths[0], 'placeholder'));
+    allowedPaths.archive = selected.filePaths[0];
+    return selected.filePaths[0];
+  }
   if (kind === 'input') {
     const selected = await dialog.showOpenDialog(window, { defaultPath: folders.input, properties: ['openFile'], filters: [{ name: 'Novel text', extensions: ['txt'] }] });
     if (!selected.canceled) {
@@ -173,6 +232,12 @@ ipcMain.handle('pick', async (_, kind) => {
     allowedPaths.output = selected.filePaths[0];
   }
   return selected.canceled ? null : selected.filePaths[0];
+});
+ipcMain.handle('default-archive', () => {
+  const folder = folders.archive;
+  if (!folder || !fs.statSync(folder, { throwIfNoEntry: false })?.isDirectory()) return null;
+  allowedPaths.archive = folder;
+  return folder;
 });
 ipcMain.handle('default-output', () => {
   const folder = folders.output;
@@ -227,6 +292,9 @@ ipcMain.handle('text-preview', (_, encoding) => {
 ipcMain.handle('command', (_, message) => {
   if (!worker || !worker.stdin.writable) throw new Error('Python backend is unavailable. Restart after installing dependencies.');
   if (!message || !['start', 'fix_epub', 'pause', 'resume', 'cancel', 'decision', 'settings', 'checkpoint_status'].includes(message.kind)) throw new Error('Invalid command');
+  if (finalizing) throw new Error('Wait for the original-file move to finish.');
+  if (message.kind === 'cancel') archiveJob = null;
+  if (message.moveOriginal !== undefined && typeof message.moveOriginal !== 'boolean') throw new Error('Invalid move-original setting');
   if (message.kind === 'start' && message.workerCount !== undefined && (!Number.isInteger(message.workerCount) || message.workerCount < 1 || message.workerCount > 3)) throw new Error('Worker count must be an integer from 1 to 3');
   if (message.kind === 'decision' && (typeof message.requestId !== 'string' || !message.requestId)) throw new Error('Validation request ID is required');
   if (message.kind === 'start' || message.kind === 'checkpoint_status') requirePreview(message);
@@ -237,6 +305,9 @@ ipcMain.handle('command', (_, message) => {
     if (path.resolve(message.output).toLowerCase() === path.resolve(message.input).toLowerCase()) throw new Error('Destination must differ from the source file');
     if (message.cover?.mode === 'import' && message.cover.imagePath !== allowedPaths.cover) throw new Error('Cover image does not match the file picker selection');
     if (message.kind !== 'checkpoint_status') {
+      archiveJob = message.kind === 'start' && message.moveOriginal
+        ? captureOriginal(message.input, allowedPaths.archive || '', message.digest) : null;
+      pendingIdle = false;
       busy = true;
       result = null;
     }

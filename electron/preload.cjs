@@ -3,6 +3,7 @@ const listeners = [];
 contextBridge.exposeInMainWorld('desktop', {
   pick: kind => ipcRenderer.invoke('pick', kind),
   defaultOutput: () => ipcRenderer.invoke('default-output'),
+  defaultArchive: () => ipcRenderer.invoke('default-archive'),
   coverPreview: () => ipcRenderer.invoke('cover-preview'),
   suggestTitle: () => ipcRenderer.invoke('suggest-title'),
   cancelTitle: () => ipcRenderer.invoke('cancel-title'),

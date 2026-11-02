@@ -193,6 +193,14 @@ def _automate_chrome_translation(
         except Exception:
             english_control.click_input()
         report("pywinauto fallback selected Translate and clicked English.")
+        if ensure_english and try_again.exists(timeout=0.1):
+            check()
+            try_again.wait("visible enabled", timeout=3)
+            try:
+                try_again.invoke()
+            except Exception:
+                try_again.click_input()
+            report("Retrying Chrome translation after explicitly selecting English.")
         return True
     except InterruptedError:
         raise
