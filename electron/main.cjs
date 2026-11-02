@@ -227,6 +227,8 @@ ipcMain.handle('text-preview', (_, encoding) => {
 ipcMain.handle('command', (_, message) => {
   if (!worker || !worker.stdin.writable) throw new Error('Python backend is unavailable. Restart after installing dependencies.');
   if (!message || !['start', 'fix_epub', 'pause', 'resume', 'cancel', 'decision', 'settings', 'checkpoint_status'].includes(message.kind)) throw new Error('Invalid command');
+  if (message.kind === 'start' && message.workerCount !== undefined && (!Number.isInteger(message.workerCount) || message.workerCount < 1 || message.workerCount > 3)) throw new Error('Worker count must be an integer from 1 to 3');
+  if (message.kind === 'decision' && (typeof message.requestId !== 'string' || !message.requestId)) throw new Error('Validation request ID is required');
   if (message.kind === 'start' || message.kind === 'checkpoint_status') requirePreview(message);
   if (message.kind === 'start' || message.kind === 'fix_epub' || message.kind === 'checkpoint_status') {
     if (busy || pendingTitle) throw new Error('A browser operation is already active');

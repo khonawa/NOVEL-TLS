@@ -226,11 +226,8 @@ class WatchdogTests(unittest.TestCase):
         with ExitStack() as stack:
             def mock(name, **kwargs):
                 return stack.enter_context(patch('novel_translator.pipeline.' + name, **kwargs))
-            mock('tempfile.mkdtemp', return_value=str(Path.cwd() / 'unused-watchdog-work'))
-            mock('shutil.rmtree')
             mock('seed_chrome_profile')
             mock('make_chunk_server', return_value=(MagicMock(), {}, 1234))
-            mock('threading.Thread')
             mock('sync_playwright').return_value.__enter__.return_value = browser
             read = mock('read_text_file', return_value='source')
             mock('split_text', return_value=['中' * 1000, '中' * 1000])
@@ -240,8 +237,7 @@ class WatchdogTests(unittest.TestCase):
             epub = mock('make_epub')
             mock('wait_for_auto_translation', return_value=True)
             wait = mock('wait_for_translation', side_effect=TimeoutError('recovery exhausted'))
-            mock('time.monotonic', side_effect=clock.now)
-            mock('time.sleep', side_effect=clock.sleep)
+            mock('CHUNK_ATTEMPT_BACKOFF_S', new=0)
             TranslationRunner(ctx).run(Path('source.txt'), Path('output.epub'))
         read.assert_called_once_with(Path('source.txt'), 'gbk', 'digest')
         self.assertEqual(wait.call_count, 3)

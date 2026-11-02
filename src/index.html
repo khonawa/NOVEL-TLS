@@ -23,6 +23,7 @@
       <label for="output">EPUB destination</label><div class="file"><input id="output" readonly placeholder="No destination selected"><button id="pick-output">Choose folder</button></div>
       <div class="translate-only"><label for="preset">Chunk size</label><select id="preset"><option value="60000">Ultra Safe · 60,000 characters</option><option value="125000">Reliable · 125,000 characters</option><option value="275000" selected>Balanced · 275,000 characters</option><option value="450000">Fast · 450,000 characters</option><option value="custom">Custom</option></select>
       <div id="custom-chunk-wrapper" style="display: none;"><label for="custom-chunk">Custom chunk size</label><input id="custom-chunk" type="number" min="1000" max="1000000" step="1000" placeholder="Enter characters (e.g. 80000)"></div></div>
+      <div class="translate-only"><label for="worker-count">Parallel Chrome workers</label><select id="worker-count"><option value="1">1 · Standard</option><option value="2">2 · Parallel (experimental)</option><option value="3">3 · Parallel (experimental)</option></select><p>Each worker opens a separate Chrome window. Native menu actions run one at a time; avoid interacting with those windows during translation. More workers use more memory and may not be faster.</p></div>
       <h3>Cover image</h3>
       <div class="cover-mode"><label><input type="radio" name="cover-mode" value="auto" checked>Auto-generate</label><label><input type="radio" name="cover-mode" value="import">Import image</label></div>
       <div id="cover-auto"><label for="cover-text-color">Text color</label><input id="cover-text-color" type="color" value="#ffffff"><label for="cover-bg-color">Background</label><input id="cover-bg-color" type="color" value="#0f131c"></div>
@@ -38,6 +39,7 @@
       <div class="metrics"><div><strong id="complete">0 / 0</strong><span>CHUNKS COMPLETE</span></div><div><strong id="failed">0</strong><span>FAILED</span></div><div><strong id="elapsed">00:00</strong><span>ELAPSED</span></div></div>
       <progress id="progress" max="1" value="0" aria-label="Translation progress"></progress>
       <p id="stats" class="stats"></p>
+      <div id="workers" class="chunks" aria-label="Worker progress"></div>
       <div id="chunks" class="chunks"><p class="empty">No active translation</p></div>
     </section>
   </div>

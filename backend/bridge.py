@@ -29,6 +29,10 @@ class Bridge:
         self.pause = threading.Event()
         self.pause.set()
         self.decisions = queue.Queue()
+        self.validation_lock = threading.Lock()
+        self.decision_lock = threading.Lock()
+        self.validation_sequence = 0
+        self.active_request = None
         self.thread = None
         self.scroll_interval = 0.5
         self.preview_cancel = threading.Event()
@@ -37,13 +41,27 @@ class Bridge:
         self.title_thread = None
 
     def decide(self, index, reason):
-        self.emit("validation", {"index": index, "reason": reason})
-        while not self.cancel.is_set():
+        from novel_translator.chrome import interruptible_lock, _ActiveClock
+        with interruptible_lock(self.validation_lock, self.cancel, self.pause):
+            with self.decision_lock:
+                self.validation_sequence += 1
+                request_id = str(self.validation_sequence)
+                self.active_request = request_id
             try:
-                return self.decisions.get(timeout=0.1)
-            except queue.Empty:
-                pass
-        raise InterruptedError("Translation cancelled.")
+                self.emit("validation", {"index": index, "reason": reason, "requestId": request_id})
+                clock = _ActiveClock(self.pause, self.cancel)
+                while True:
+                    clock.now()
+                    try:
+                        response_id, decision = self.decisions.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if response_id == request_id:
+                        clock.now()
+                        return decision
+            finally:
+                with self.decision_lock:
+                    self.active_request = None
 
     def command(self, message):
         kind = message.get("kind")
@@ -118,6 +136,7 @@ class Bridge:
                 cover_options=cover_options,
                 source_encoding=message.get("encoding", "auto"),
                 source_digest=message.get("digest"),
+                worker_count=message.get("workerCount", 1),
             )
             self.thread = threading.Thread(target=self.run, args=(context, source, output))
             self.thread.start()
@@ -150,7 +169,12 @@ class Bridge:
             decision = message.get("value")
             if decision not in ("retry", "accept", "skip"):
                 raise ValueError("Unknown validation decision.")
-            self.decisions.put(decision)
+            with self.decision_lock:
+                request_id = message.get("requestId")
+                if self.cancel.is_set() or self.active_request is None or request_id != self.active_request:
+                    return
+                self.active_request = None
+                self.decisions.put((request_id, decision))
         else:
             raise ValueError("Unknown command.")
 
@@ -245,6 +269,9 @@ def _validate_start_command(message):
     remaining_limit = message.get("remainingChineseLimit", 50)
     if type(remaining_limit) is not int or remaining_limit < 0:
         errors.append("Chinese character tolerance must be a nonnegative whole number.")
+    workers = message.get("workerCount", 1)
+    if type(workers) is not int or not 1 <= workers <= 3:
+        errors.append("Worker count must be a whole number between 1 and 3.")
     sweeps = message.get("sweeps", 2)
     interval = float(message.get("scrollInterval", 0.5))
     if not 0.1 <= interval <= 5:

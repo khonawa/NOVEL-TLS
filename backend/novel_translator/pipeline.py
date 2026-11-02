@@ -16,6 +16,7 @@ import logging
 import queue
 import shutil
 import tempfile
+import uuid
 import threading
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from .checkpoint import (
 )
 from .chrome import (
     _ActiveClock,
+    interruptible_lock,
     automate_chrome_translation,
     seed_chrome_profile,
     wait_for_auto_translation,
@@ -56,6 +58,7 @@ from .text_processing import (
     split_text,
 )
 from .translation import validate_translated_chunk
+from .worker_cleanup import BrowserCleanup
 
 log = logging.getLogger("novel_translator.pipeline")
 
@@ -150,6 +153,7 @@ class PipelineContext:
     pause_event: threading.Event
     get_scroll_interval: Callable[[], float]
     get_required_sweeps: Callable[[], int]
+    worker_count: int = field(default=1, kw_only=True)
     source_encoding: str = field(default="auto", kw_only=True)
     source_digest: str | None = field(default=None, kw_only=True)
     remaining_chinese_limit: int = field(default=0, kw_only=True)
@@ -162,7 +166,10 @@ class TranslationRunner:
     """Runs the full read -> chunk -> translate -> EPUB pipeline (#11)."""
 
     def __init__(self, ctx: PipelineContext) -> None:
+        if type(ctx.worker_count) is not int or not 1 <= ctx.worker_count <= 3:
+            raise ValueError("Worker count must be an integer between 1 and 3.")
         self.ctx = ctx
+        self.validation_lock = threading.Lock()
 
     def _emit(self, kind: str, value: object) -> None:
         self.ctx.events.put(UiEvent(kind, value))
@@ -173,6 +180,8 @@ class TranslationRunner:
 
     def run(self, input_path: Path, output_path: Path) -> None:
         work_dir = Path(tempfile.mkdtemp(prefix="novel-translator-"))
+        workers = []
+        stop = threading.Event()
         server: HTTPServer | None = None
         server_thread: threading.Thread | None = None
         try:
@@ -212,169 +221,62 @@ class TranslationRunner:
                 log.info("Resuming with %d/%d saved chunks.", len(completed), len(chunks))
                 self._emit("progress", len(completed) / len(chunks))
 
-            profile_dir = work_dir / "chrome-profile"
-            seed_chrome_profile(profile_dir)
-
             server, chunk_map, port = make_chunk_server()
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
-
-            def _clear_profile_locks() -> None:
-                # A crashed Chrome can leave a SingletonLock that makes the next
-                # launch fail with "profile in use"; clear it first (#17).
-                for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-                    try:
-                        (profile_dir / lock_name).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
-            with sync_playwright() as playwright:
-                # Launch Chrome once and reuse it across chunks (#7); each chunk
-                # just navigates the same page, so a run no longer pays a browser
-                # relaunch (profile spin-up + window + CDP) per chunk.
-                context = None
-                page = None
-                for index, chunk in enumerate(chunks, start=1):
-                    if self.ctx.cancel_event.is_set():
-                        raise InterruptedError("Translation cancelled.")
-                    if index in completed:
-                        log.info("Chunk %d/%d restored from saved progress.", index, len(chunks))
-                        continue
+            jobs = queue.Queue()
+            results = queue.Queue()
+            for index, chunk in enumerate(chunks, 1):
+                if index not in completed:
+                    jobs.put((index, chunk))
+            pending = jobs.qsize()
+            count = min(self.ctx.worker_count, pending)
+            for worker_id in range(1, count + 1):
+                worker = threading.Thread(
+                    target=self._worker,
+                    args=(worker_id, work_dir, jobs, results, chunk_map, port, len(chunks), stop),
+                    name=f"translation-{worker_id}", daemon=True,
+                )
+                workers.append(worker)
+                worker.start()
+            finished = 0
+            while finished < count:
+                _ActiveClock(self.ctx.pause_event, self.ctx.cancel_event).now()
+                try:
+                    kind, worker_id, index, value = results.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if kind == "finished":
+                    finished += 1
+                    self._worker_status(worker_id, 0, "Idle", 0.0)
+                    continue
+                if kind == "fatal":
+                    raise RuntimeError(f"Worker {worker_id} failed: {value}")
+                if kind == "started":
                     statuses[index - 1] = "Translating"
-                    self._emit("chunk_statuses", statuses.copy())
+                    self._worker_status(worker_id, index, "Translating", 0.0)
                     self._emit("current_chunk", (index, 0.0))
-                    # Serve this chunk from memory; no per-chunk file on disk (#10).
-                    chunk_name = f"chunk_{index:04d}.html"
-                    chunk_map[chunk_name] = chunk_html(chunk, f"Chunk {index}").encode("utf-8")
                     self._emit("status", f"Translating {index}/{len(chunks)}")
-
-                    result = ""
-                    chunk_started = time.monotonic()
-                    last_error: Exception | None = None
-                    attempt_clock = _ActiveClock(self.ctx.pause_event, self.ctx.cancel_event)
-                    for attempt in range(1, CHUNK_MAX_ATTEMPTS + 1):
-                        try:
-                            attempt_clock.now()
-                            log.info(
-                                "Translating chunk %d/%d (attempt %d/%d)...",
-                                index, len(chunks), attempt, CHUNK_MAX_ATTEMPTS,
-                            )
-                            if page is None or page.is_closed():
-                                if context is not None:
-                                    try:
-                                        context.close()
-                                    except Exception:
-                                        pass
-                                    context = None
-                                _clear_profile_locks()
-                                context = playwright.chromium.launch_persistent_context(
-                                    str(profile_dir), channel="chrome", headless=False,
-                                    locale="en-US",
-                                    args=[
-                                        "--lang=en-US",
-                                        "--enable-features=Translate,TranslateUI,AutoTranslate",
-                                        "--disable-features=TranslateLanguageByULP",
-                                        f"--host-resolver-rules=MAP {CHUNK_HOST} 127.0.0.1",
-                                        "--window-position=100,100",
-                                    ],
-                                )
-                                page = context.pages[0] if context.pages else context.new_page()
-                                # Persistent contexts still expose the Browser, so
-                                # resolve its PID once at launch and cache it (#6).
-                                page._novel_chrome_pid = chrome_pid_for(context.browser)
-                                log.info("Chrome ready; reusing this window for all chunks.")
-                            page.goto(
-                                f"http://{CHUNK_HOST}:{port}/{chunk_name}",
-                                wait_until="domcontentloaded", timeout=CHROME_GOTO_TIMEOUT_MS,
-                            )
-                            page.wait_for_timeout(CHROME_SETTLE_MS)
-                            # The browser PID was resolved once at launch and cached
-                            # on the page; passing it lets chrome.py match by PID (#6).
-                            chrome_pid = getattr(page, "_novel_chrome_pid", None)
-
-                            def retry_translation() -> bool:
-                                if self.ctx.cancel_event.is_set():
-                                    raise InterruptedError("Translation cancelled.")
-                                return automate_chrome_translation(page, self._report, chrome_pid)
-
-                            original_count = chinese_count(chunk)
-                            log.info("Page ready; waiting for Chrome auto-translate...")
-                            if wait_for_auto_translation(
-                                page, original_count, self.ctx.cancel_event,
-                                pause_event=self.ctx.pause_event,
-                            ):
-                                log.info("Chrome auto-translate detected; no UI fallback needed.")
-                            else:
-                                log.info(
-                                    "Chrome auto-translate did not start; using pywinauto fallback."
-                                )
-                                retry_translation()
-                            candidate = wait_for_translation(
-                                page, original_count, self.ctx.cancel_event,
-                                self._report, retry_translation,
-                                self.ctx.get_scroll_interval, self.ctx.get_required_sweeps,
-                                pause_event=self.ctx.pause_event,
-                                report_progress=lambda ratio: self._emit(
-                                    "drop_rate", (index, max(0.0, min(1.0, 1.0 - ratio)))
-                                ),
-                                remaining_chinese_limit=self.ctx.remaining_chinese_limit,
-                            )
-                            attempt_clock.now()
-                            valid, reason = validate_translated_chunk(
-                                chunk, candidate, self.ctx.remaining_chinese_limit
-                            )
-                            if not valid:
-                                decision = self.ctx.request_validation(index, reason)
-                                if decision == "retry":
-                                    raise ValueError(f"Chunk validation failed: {reason}.")
-                                if decision == "skip":
-                                    candidate = (
-                                        "[Chunk skipped after failed translation validation.]"
-                                    )
-                                else:
-                                    log.info(
-                                        "Chunk %d accepted despite validation warning.", index
-                                    )
-                            result = candidate
-                            break
-                        except InterruptedError:
-                            raise
-                        except Exception as exc:
-                            last_error = exc
-                            log.warning("Chunk %d attempt %d failed: %s", index, attempt, exc)
-                            if attempt < CHUNK_MAX_ATTEMPTS:
-                                log.info("Retrying the current chunk with a fresh navigation...")
-                                retry_at = attempt_clock.now() + CHUNK_ATTEMPT_BACKOFF_S
-                                while attempt_clock.now() < retry_at:
-                                    time.sleep(0.1)
-                    if not result:
+                elif kind == "validation":
+                    self._worker_status(worker_id, index, "Awaiting validation", 0.0)
+                elif kind == "progress":
+                    self._worker_status(worker_id, index, "Translating", value)
+                    self._emit("drop_rate", (index, value))
+                elif kind == "result":
+                    result, elapsed = value
+                    if result:
+                        save_checkpoint_chunk(progress_dir, index, result)
+                        completed[index] = result
+                        statuses[index - 1] = "Complete"
+                        self._worker_status(worker_id, index, "Complete", 1.0)
+                        self._emit("stats", (len(result), elapsed, index, 100.0, False))
+                        self._emit("progress", len(completed) / len(chunks))
+                    else:
                         statuses[index - 1] = "Failed"
-                        self._emit("chunk_statuses", statuses.copy())
-                        log.warning(
-                            "Chunk %d marked failed after %d attempts: %s",
-                            index, CHUNK_MAX_ATTEMPTS, last_error,
-                        )
-                        self._emit("run_info", (len(completed), len(chunks), statuses.count("Failed")))
+                        self._worker_status(worker_id, index, "Failed", 0.0)
                         self._emit("stats", (0, 0.0, index, 0.0, True))
-                        continue
-                    attempt_clock.now()
-                    save_checkpoint_chunk(progress_dir, index, result)
-                    completed[index] = result
-                    statuses[index - 1] = "Complete"
-                    self._emit("chunk_statuses", statuses.copy())
-                    chunk_map.pop(chunk_name, None)
-                    self._emit("stats", (len(result), time.monotonic() - chunk_started, index, 100.0, False))
-                    self._emit("progress", len(completed) / len(chunks))
                     self._emit("run_info", (len(completed), len(chunks), statuses.count("Failed")))
-                    log.info(
-                        "Chunk %d validated and saved (%d translated characters).",
-                        index, len(result),
-                    )
-                if context is not None:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
+                self._emit("chunk_statuses", statuses.copy())
 
             if self.ctx.cancel_event.is_set():
                 raise InterruptedError("Translation cancelled.")
@@ -392,6 +294,10 @@ class TranslationRunner:
         except (Exception, PlaywrightTimeoutError) as exc:
             self._emit("error", str(exc) or exc.__class__.__name__)
         finally:
+            stop.set()
+            deadline = time.monotonic() + 10.0
+            for worker in workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if server is not None:
                 try:
                     # Only shut down while serve_forever() is actually running;
@@ -402,4 +308,175 @@ class TranslationRunner:
                     server.server_close()
                 except Exception:
                     pass
-            shutil.rmtree(work_dir, ignore_errors=True)
+            if any(worker.is_alive() for worker in workers):
+                self._report(f"Browser cleanup exceeded 10 seconds; isolated profiles retained at {work_dir}.")
+            else:
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _worker_status(self, worker_id, index, status, progress):
+        self._emit("worker_status", {"workerId": worker_id, "index": index,
+                                     "status": status, "progress": progress})
+
+    def _worker(self, worker_id, work_dir, jobs, results, chunk_map, port, total, stop):
+        cancel = _RunCancellation(self.ctx.cancel_event, stop)
+        profile_dir = work_dir / f"chrome-profile-{worker_id}"
+        index = 0
+        cleanup = None
+        try:
+            seed_chrome_profile(profile_dir)
+            with sync_playwright() as playwright:
+                cleanup = BrowserCleanup(playwright, cancel)
+                try:
+                    self._consume_jobs(worker_id, playwright, profile_dir, jobs, results,
+                                       chunk_map, port, total, cancel, cleanup)
+                finally:
+                    cleanup.closing.set()
+        except InterruptedError:
+            pass
+        except Exception as exc:
+            results.put(("fatal", worker_id, index, str(exc)))
+        finally:
+            if cleanup is not None:
+                cleanup.finish()
+            results.put(("finished", worker_id, 0, None))
+
+    def _consume_jobs(self, worker_id, playwright, profile_dir, jobs, results,
+                      chunk_map, port, total, cancel, cleanup):
+        context = None
+        page = None
+        try:
+            while True:
+                _ActiveClock(self.ctx.pause_event, cancel).now()
+                try:
+                    index, chunk = jobs.get_nowait()
+                except queue.Empty:
+                    return
+                chunk_name = f"chunk_{index:04d}.html"
+                chunk_map[chunk_name] = chunk_html(chunk, f"Chunk {index}").encode("utf-8")
+                results.put(("started", worker_id, index, None))
+                try:
+                    result = ""
+                    chunk_started = time.monotonic()
+                    last_error: Exception | None = None
+                    attempt_clock = _ActiveClock(self.ctx.pause_event, cancel)
+                    for attempt in range(1, CHUNK_MAX_ATTEMPTS + 1):
+                        try:
+                            attempt_clock.now()
+                            log.info(
+                                "Translating chunk %d/%d (attempt %d/%d)...",
+                                index, total, attempt, CHUNK_MAX_ATTEMPTS,
+                            )
+                            if page is None or page.is_closed():
+                                if context is not None:
+                                    try:
+                                        context.close()
+                                    except Exception:
+                                        pass
+                                    context = None
+                                context = playwright.chromium.launch_persistent_context(
+                                    str(profile_dir), channel="chrome", headless=False,
+                                    locale="en-US", timeout=20000,
+                                    args=[
+                                        "--lang=en-US",
+                                        "--enable-features=Translate,TranslateUI,AutoTranslate",
+                                        "--disable-features=TranslateLanguageByULP",
+                                        f"--host-resolver-rules=MAP {CHUNK_HOST} 127.0.0.1",
+                                        "--window-position=100,100",
+                                    ],
+                                )
+                                page = context.pages[0] if context.pages else context.new_page()
+                                # Persistent contexts still expose the Browser, so
+                                # resolve its PID once at launch and cache it (#6).
+                                page._novel_chrome_pid = chrome_pid_for(context.browser)
+                                cleanup.track_browser(page._novel_chrome_pid)
+                                log.info("Chrome ready; reusing this window for all chunks.")
+                            page.goto(
+                                f"http://{CHUNK_HOST}:{port}/{chunk_name}",
+                                wait_until="domcontentloaded", timeout=CHROME_GOTO_TIMEOUT_MS,
+                            )
+                            page.wait_for_timeout(CHROME_SETTLE_MS)
+                            # The browser PID was resolved once at launch and cached
+                            # on the page; passing it lets chrome.py match by PID (#6).
+                            chrome_pid = getattr(page, "_novel_chrome_pid", None)
+
+                            def retry_translation() -> bool:
+                                if cancel.is_set():
+                                    raise InterruptedError("Translation cancelled.")
+                                return automate_chrome_translation(page, self._report, chrome_pid,
+                                                                   cancel=cancel, pause_event=self.ctx.pause_event)
+
+                            original_count = chinese_count(chunk)
+                            log.info("Page ready; waiting for Chrome auto-translate...")
+                            if wait_for_auto_translation(
+                                page, original_count, cancel,
+                                pause_event=self.ctx.pause_event,
+                            ):
+                                log.info("Chrome auto-translate detected; no UI fallback needed.")
+                            else:
+                                log.info(
+                                    "Chrome auto-translate did not start; using pywinauto fallback."
+                                )
+                                retry_translation()
+                            candidate = wait_for_translation(
+                                page, original_count, cancel,
+                                self._report, retry_translation,
+                                self.ctx.get_scroll_interval, self.ctx.get_required_sweeps,
+                                pause_event=self.ctx.pause_event,
+                                report_progress=lambda ratio: results.put(("progress", worker_id, index,
+                                    max(0.0, min(1.0, 1.0 - ratio)))),
+                                remaining_chinese_limit=self.ctx.remaining_chinese_limit,
+                            )
+                            attempt_clock.now()
+                            valid, reason = validate_translated_chunk(
+                                chunk, candidate, self.ctx.remaining_chinese_limit
+                            )
+                            if not valid:
+                                with interruptible_lock(self.validation_lock, cancel, self.ctx.pause_event):
+                                    results.put(("validation", worker_id, index, None))
+                                    decision = self.ctx.request_validation(index, reason)
+                                    attempt_clock.now()
+                                    results.put(("started", worker_id, index, None))
+                                if decision == "retry":
+                                    raise ValueError(f"Chunk validation failed: {reason}.")
+                                if decision == "skip":
+                                    candidate = (
+                                        "[Chunk skipped after failed translation validation.]"
+                                    )
+                                elif decision == "accept":
+                                    log.info(
+                                        "Chunk %d accepted despite validation warning.", index
+                                    )
+                                else:
+                                    raise ValueError("Unknown validation decision.")
+                            result = candidate
+                            break
+                        except InterruptedError:
+                            raise
+                        except Exception as exc:
+                            last_error = exc
+                            log.warning("Chunk %d attempt %d failed: %s", index, attempt, exc)
+                            if attempt < CHUNK_MAX_ATTEMPTS:
+                                log.info("Retrying the current chunk with a fresh navigation...")
+                                retry_at = attempt_clock.now() + CHUNK_ATTEMPT_BACKOFF_S
+                                while attempt_clock.now() < retry_at:
+                                    time.sleep(0.1)
+                    attempt_clock.now()
+                    results.put(("result", worker_id, index, (result, time.monotonic() - chunk_started)))
+                finally:
+                    chunk_map.pop(chunk_name, None)
+        finally:
+            cleanup.closing.set()
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    log.exception("Worker %d Chrome close failed", worker_id)
+
+
+class _RunCancellation:
+    def __init__(self, external, internal):
+        self.external = external
+        self.internal = internal
+
+    def is_set(self):
+        return self.external.is_set() or self.internal.is_set()

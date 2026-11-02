@@ -85,6 +85,24 @@ test('preview authorization, correlation, selection invalidation and sandbox', a
   assert.throws(() => call('command', message), /Preview and confirm/);
 });
 
+test('parallel worker bounds and validation correlation are checked before forwarding', async () => {
+  const { call, children, respond } = await harness();
+  const child = children[0];
+  for (const workerCount of [0, 4, 1.5, '2', true, null]) {
+    assert.throws(() => call('command', { kind: 'start', workerCount }), /Worker count/);
+  }
+  assert.throws(() => call('command', { kind: 'decision', value: 'accept' }), /request ID/);
+  call('command', { kind: 'decision', value: 'retry', requestId: 'synthetic-id' });
+  assert.equal(child.messages.at(-1).requestId, 'synthetic-id');
+  call('drop-input', 'C:\\books\\novel.txt');
+  const preview = call('text-preview', 'utf-8');
+  respond(child, { requestId: child.messages.at(-1).requestId, encoding: 'utf-8', digest: 'new' });
+  await preview;
+  await call('pick', 'output');
+  call('command', { kind: 'start', input: 'C:\\books\\novel.txt', output: 'C:\\books\\novel.epub', encoding: 'utf-8', digest: 'new', workerCount: 3 });
+  assert.equal(child.messages.at(-1).workerCount, 3);
+});
+
 test('preview errors, cancellation and backend failures settle requests', async () => {
   const { call, children, respond } = await harness();
   call('drop-input', 'C:\\books\\novel.txt');

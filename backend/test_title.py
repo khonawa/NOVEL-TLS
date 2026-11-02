@@ -30,6 +30,7 @@ class TitleTests(unittest.TestCase):
         page.viewport_size = {'width': 800, 'height': 600}
         desktop = Mock()
         chrome = desktop.return_value.window.return_value
+        chrome.wrapper_object.return_value.process_id.return_value = 123
         with patch('novel_translator.chrome._get_desktop_class', return_value=desktop):
             self.assertTrue(automate_chrome_translation(page, Mock(), 123, ensure_english=True))
         page.mouse.click.assert_called_once()
@@ -117,6 +118,7 @@ class TitleTests(unittest.TestCase):
         page.viewport_size = {'width': 800, 'height': 600}
         desktop = Mock()
         chrome = desktop.return_value.window.return_value
+        chrome.wrapper_object.return_value.process_id.return_value = 123
         chrome.child_window.return_value.exists.return_value = False
         chrome.rectangle.return_value = Mock(left=1200, top=200, width=lambda: 800, height=lambda: 600)
         with patch('novel_translator.chrome._get_desktop_class', return_value=desktop):

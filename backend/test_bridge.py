@@ -63,7 +63,7 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(bridge.pause.is_set())
         bridge.command({"kind": "resume"})
         self.assertTrue(bridge.pause.is_set())
-        bridge.command({"kind": "decision", "value": "retry"})
+        bridge.emit = lambda kind, value: bridge.command({"kind": "decision", "value": "retry", "requestId": value["requestId"]})
         self.assertEqual(bridge.decide(1, "test"), "retry")
         bridge.command({"kind": "cancel"})
         self.assertTrue(bridge.cancel.is_set())

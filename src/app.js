@@ -1,3 +1,4 @@
+/* global Image */
 const element = id => document.getElementById(id);
 const api = window.desktop;
 let ready = false;
@@ -14,6 +15,30 @@ let sourcePreview = null;
 let checkpointRequest = 0;
 let titleGeneration = 0;
 let titleWorking = false;
+let validationRequestId = null;
+let decisionPending = false;
+let translatedCharacters = 0;
+const workerStates = new Map();
+
+function renderWorkers() {
+  element('workers').replaceChildren(...[...workerStates.values()].sort((a, b) => a.workerId - b.workerId).map(worker => {
+    const row = document.createElement('div');
+    row.className = 'chunk';
+    const title = document.createElement('strong');
+    title.textContent = `Worker ${worker.workerId}`;
+    const status = document.createElement('span');
+    const progress = typeof worker.progress === 'number' ? ` · ${Math.round(worker.progress * 100)}%` : '';
+    status.textContent = `${worker.index ? `Chunk ${worker.index} · ` : ''}${worker.status}${progress}`;
+    row.append(title, status);
+    return row;
+  }));
+}
+
+function clearValidation() {
+  validationRequestId = null;
+  decisionPending = false;
+  element('validation').close();
+}
 
 function invalidateTitle() {
   titleGeneration++;
@@ -50,6 +75,7 @@ async function suggestTitle() {
 
 
 loadSettings();
+element('worker-count').onchange = () => localStorage.setItem('worker-count', element('worker-count').value);
 element('encoding').onchange = refreshPreview;
 element('refresh-preview').onclick = refreshPreview;
 element('confirm-encoding').onchange = () => { controls(); checkForCheckpoint(); };
@@ -119,6 +145,8 @@ if (api) {
 controls();
 
 function loadSettings() {
+  const savedWorkers = localStorage.getItem('worker-count');
+  element('worker-count').value = ['1', '2', '3'].includes(savedWorkers) ? savedWorkers : '1';
   const savedPreset = localStorage.getItem('preset');
   const validPresets = ['60000', '125000', '275000', '450000', 'custom'];
   element('preset').value = validPresets.includes(savedPreset) ? savedPreset : '275000';
@@ -230,7 +258,7 @@ function controls() {
   element('encoding').disabled = !ready || busy;
   element('refresh-preview').disabled = !ready || busy || !element('input').value;
   element('confirm-encoding').disabled = !ready || busy || !sourcePreview;
-  for (const id of ['pick-input', 'pick-output', 'preset', 'name', 'original-name', 'chinese-limit', 'custom-chunk', 'pick-cover']) element(id).disabled = !ready || busy;
+  for (const id of ['pick-input', 'pick-output', 'preset', 'name', 'original-name', 'chinese-limit', 'custom-chunk', 'pick-cover', 'worker-count']) element(id).disabled = !ready || busy;
   for (const radio of document.querySelectorAll('[name="mode"], [name="cover-mode"]')) radio.disabled = busy;
   for (const id of ['scroll-interval', 'scroll-slider']) element(id).disabled = !ready;
   element('pause').disabled = !busy;
@@ -322,7 +350,7 @@ async function start() {
     : { mode: 'import', imagePath: coverImage || null, crop: cropRegion() };
   const message = isFixMode()
     ? { kind: 'fix_epub', input: element('input').value, output: element('output').value, cover: coverOptions }
-    : { kind: 'start', input: element('input').value, output: element('output').value, encoding: sourcePreview.encoding, digest: sourcePreview.digest, chunkLimit: getChunkSize(), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions };
+    : { kind: 'start', input: element('input').value, output: element('output').value, encoding: sourcePreview.encoding, digest: sourcePreview.digest, chunkLimit: getChunkSize(), workerCount: Number(element('worker-count').value), scrollInterval: Number(element('scroll-interval').value), remainingChineseLimit: Number(element('chinese-limit').value), cover: coverOptions };
   if (await command(message)) {
     started = Date.now();
     element('status').textContent = 'Running';
@@ -344,7 +372,7 @@ async function togglePause() {
 async function cancel() {
   if (await command({ kind: 'cancel' })) {
     element('status').textContent = 'Cancelling';
-    element('validation').close();
+    clearValidation();
   }
 }
 
@@ -358,7 +386,16 @@ async function openResult(folder) {
 }
 
 async function sendDecision(decision) {
-  if (await command({ kind: 'decision', value: decision })) element('validation').close();
+  if (!validationRequestId || decisionPending) return;
+  const requestId = validationRequestId;
+  decisionPending = true;
+  for (const button of document.querySelectorAll('[data-decision]')) button.disabled = true;
+  const accepted = await command({ kind: 'decision', value: decision, requestId });
+  // A new prompt can arrive before the IPC acknowledgement for the previous one.
+  if (validationRequestId !== requestId) return;
+  decisionPending = false;
+  if (accepted) clearValidation();
+  else for (const button of document.querySelectorAll('[data-decision]')) button.disabled = false;
 }
 
 async function restartBackend() {
@@ -380,6 +417,7 @@ async function exportDiagnostics() {
     `Input selected: ${Boolean(element('input').value)}`,
     `Output selected: ${Boolean(element('output').value)}`,
     `Preset: ${element('preset').options[element('preset').selectedIndex]?.text || 'unknown'}`,
+    `Workers: ${element('worker-count').value}`,
     `Scroll interval: ${element('scroll-interval').value}s`,
     `Chinese limit: ${element('chinese-limit').value}`,
     `Status: ${element('status').textContent}`,
@@ -398,6 +436,11 @@ async function exportDiagnostics() {
 }
 
 function resetRun() {
+  started = 0;
+  translatedCharacters = 0;
+  workerStates.clear();
+  renderWorkers();
+  clearValidation();
   element('open').disabled = true;
   element('folder').disabled = true;
   element('retry').disabled = true;
@@ -469,13 +512,18 @@ function handleEvent({ kind, value }) {
     element('complete').textContent = `${complete} / ${total}`;
     element('failed').textContent = failed;
   }
+  if (kind === 'worker_status') {
+    workerStates.set(value.workerId, value);
+    renderWorkers();
+  }
   if (kind === 'stats') {
-    const [chars, duration, , pct] = value;
-    if (chars > 0 && duration > 0) currentStats.speed = Math.round(chars / duration);
-    currentStats.currentPct = pct;
+    const [chars, , , pct] = value;
+    if (chars > 0) translatedCharacters += chars;
+    if (started) currentStats.speed = Math.round(translatedCharacters / Math.max(1, (Date.now() - started) / 1000));
+    currentStats.currentPct = Number(element('worker-count').value) === 1 ? pct : 0;
     renderStats();
   }
-  if (kind === 'current_chunk') {
+  if (kind === 'current_chunk' && Number(element('worker-count').value) === 1) {
     const [, pct] = value;
     currentStats.currentPct = pct;
     renderStats();
@@ -493,8 +541,11 @@ function handleEvent({ kind, value }) {
     }));
   }
   if (kind === 'validation') {
+    validationRequestId = value.requestId;
+    decisionPending = false;
+    for (const button of document.querySelectorAll('[data-decision]')) button.disabled = false;
     element('reason').textContent = `Chunk ${value.index}: ${value.reason}`;
-    element('validation').showModal();
+    if (!element('validation').open) element('validation').showModal();
   }
   if (kind === 'checkpoint_status' && value.requestId === checkpointRequest) {
     if (value.error?.includes('Source changed since preview')) {
@@ -521,9 +572,15 @@ function handleEvent({ kind, value }) {
     element('status').textContent = 'Stopped';
     setNotice(String(value));
     log(value);
-    element('validation').close();
+    clearValidation();
   }
   if (['idle', 'command_error', 'offline'].includes(kind)) {
+    clearValidation();
+    for (const worker of workerStates.values()) {
+      worker.status = kind === 'offline' ? 'Backend offline' : 'Stopped';
+      delete worker.progress;
+    }
+    renderWorkers();
     busy = false;
     paused = false;
   }

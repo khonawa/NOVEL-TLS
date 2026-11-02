@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import re
 import threading
 import time
@@ -75,37 +76,77 @@ def seed_chrome_profile(profile_dir: Path) -> None:
     (default_dir / "Preferences").write_text(json.dumps(preferences), encoding="utf-8")
 
 
+_NATIVE_UI_LOCK = threading.Lock()
+
+
+@contextmanager
+def interruptible_lock(lock, cancel, pause_event=None):
+    """Wait without monopolizing a lock while paused; cancellation wakes all waiters."""
+    clock = _ActiveClock(pause_event, cancel)
+    while True:
+        clock.now()
+        if not lock.acquire(timeout=0.1):
+            continue
+        if cancel.is_set() or (pause_event is not None and not pause_event.is_set()):
+            lock.release()
+            continue
+        break
+    try:
+        clock.now()
+        yield
+    finally:
+        lock.release()
+
+
 def automate_chrome_translation(
     page: Page,
     report: Callable[[str], None],
     pid: "int | None" = None,
     *,
     ensure_english: bool = False,
+    cancel: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
 ) -> bool:
-    """Invoke Chrome's native page-translation menu through Windows UI Automation."""
+    """Serialize the entire native interaction, including focus and dismissal."""
+    cancel = cancel if cancel is not None else threading.Event()
+    with interruptible_lock(_NATIVE_UI_LOCK, cancel, pause_event):
+        return _automate_chrome_translation(
+            page, report, pid, ensure_english=ensure_english,
+            check=lambda: _ActiveClock(pause_event, cancel).now(),
+        )
+
+
+def _automate_chrome_translation(
+    page: Page,
+    report: Callable[[str], None],
+    pid: "int | None" = None,
+    *,
+    ensure_english: bool = False,
+    check: Callable[[], object] = lambda: None,
+) -> bool:
+    """Invoke only controls owned by the verified launched Chrome process."""
+    if type(pid) is not int or pid <= 0:
+        report("Native translation skipped: Chrome process identity is unavailable.")
+        return False
+    menu = None
     Desktop = _get_desktop_class()
     if Desktop is None:
         report("Windows UI automation is unavailable; use the Chrome context menu manually.")
         return False
     try:
+        check()
         page.bring_to_front()
         page.wait_for_timeout(500)
+        check()
         page_title = page.title()
         # Prefer the launched browser's own process so we never drive an
         # unrelated Chrome window whose title happens to match (#6).
         desktop = Desktop(backend="uia")
-        if pid:
-            try:
-                chrome = desktop.window(process=pid, title_re=rf".*{re.escape(page_title)}.*")
-                chrome.wait("visible", timeout=3)
-            except Exception:
-                if ensure_english:
-                    raise
-                chrome = desktop.window(title_re=rf".*{re.escape(page_title)}.*Chrome.*")
-                chrome.wait("visible", timeout=10)
-        else:
-            chrome = desktop.window(title_re=rf".*{re.escape(page_title)}.*Chrome.*")
-            chrome.wait("visible", timeout=10)
+        chrome = desktop.window(process=pid, title_re=rf".*{re.escape(page_title)}.*")
+        chrome.wait("visible", timeout=3)
+        if chrome.wrapper_object().process_id() != pid:
+            raise RuntimeError("Chrome window process identity mismatch.")
+        check()
         chrome.restore()
         chrome.set_focus()
         try_again = chrome.child_window(
@@ -122,8 +163,13 @@ def automate_chrome_translation(
         # Use content coordinates, not screen coordinates interpreted as window-relative.
         viewport = page.viewport_size or page.evaluate("() => ({width: innerWidth, height: innerHeight})")
         page.mouse.click(viewport["width"] // 2, viewport["height"] // 2, button="right")
-        menu = Desktop(backend="uia").window(class_name="#32768")
+        check()
+        menu = desktop.window(process=pid, class_name="#32768")
         menu.wait("visible", timeout=5)
+        if menu.wrapper_object().process_id() != pid:
+            menu = None
+            raise RuntimeError("Chrome menu process identity mismatch.")
+        check()
         translation_item = menu.child_window(title_re=r"(?i).*translate.*", control_type="MenuItem")
         translation_item.wait("visible enabled", timeout=8)
         try:
@@ -141,19 +187,25 @@ def automate_chrome_translation(
         if not english_control.exists(timeout=2):
             english_control = chrome.child_window(title_re=r"(?i)^English$")
         english_control.wait("visible enabled", timeout=5)
+        check()
         try:
             english_control.invoke()
         except Exception:
             english_control.click_input()
         report("pywinauto fallback selected Translate and clicked English.")
         return True
+    except InterruptedError:
+        raise
     except Exception as exc:
         report(f"Automatic Chrome menu selection failed ({exc}); choose Translate to English manually.")
-        try:
-            Desktop(backend="uia").window(class_name="#32768").press_escape()
-        except Exception:
-            pass
         return False
+    finally:
+        if menu is not None:
+            try:
+                if menu.wrapper_object().process_id() == pid and menu.exists(timeout=0.1):
+                    menu.type_keys("{ESC}", set_foreground=False)
+            except Exception:
+                pass
 
 
 def _pace(pause_event: threading.Event | None, cancel: threading.Event) -> None:

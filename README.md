@@ -37,6 +37,16 @@ Pause/resume and cancellation use the original pipeline's thread-safe controls.
 Validation failures offer retry, accept, or skip. Starting again with the same files and preset resumes checkpoints.
 Changing the preset changes checkpoint compatibility. Completed books can be opened or revealed in Explorer.
 
+### Parallel Chrome workers (experimental)
+
+Choose **Parallel Chrome workers** before starting: **1** (default), **2**, or **3**. The selection is remembered and locked during a run. Each active worker owns a separate Chrome window, Playwright instance, and temporary profile, and processes pending chunks from the same book. Extra workers do not help a one-chunk book. More windows require more RAM; service/network limits can make additional workers slower rather than faster.
+
+Native Translate-menu interactions must run one at a time because Windows foreground focus and menus are shared. Workers serialize those interactions while other pages can continue translating. Avoid clicking or typing in the automation windows: an application lock cannot prevent human interference. The overview shows each worker's chunk, status, and translation percentage. Throughput uses translated characters divided by elapsed run time, not summed worker durations.
+
+Validation prompts are shown one at a time and replies are correlated to the requesting chunk. Pause/cancel applies across the run. Completed chunks are saved by the coordinator, and the final EPUB is assembled in source order even when workers finish out of order. You can resume compatible checkpoints with a different worker count; changing the chunk size still changes checkpoint compatibility. Filename translation remains separate and cannot overlap a book run.
+
+**Verification:** automated concurrency tests and browser-preview UI checks do not establish real Chrome translation speed or native-menu reliability. Before relying on parallel mode, compare fresh runs of the same synthetic/sample book at 1, 2, and 3 workers with the same chunk size. Check total time, peak RAM, validation/retry frequency, output order and completeness, simultaneous fallback behavior, and pause/cancel cleanup. Keep 1 worker available as the fallback.
+
 ### Optional English filename suggestion
 
 After selecting a TXT, click **Translate filename to English** to opt in. This opens installed Chrome and displays only the source filename stem as visible content in a short-lived, loopback-served HTML page. **Chrome’s online translation service is used; this is not offline translation.** No extra API key, dependency, or service is added. Nothing is submitted just by choosing a file.
